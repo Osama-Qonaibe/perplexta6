@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="perplextaBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#181715"/>
+      <stop offset="100%" stop-color="#0e0d0c"/>
+    </linearGradient>
+    <linearGradient id="perplextaEmerald" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="50%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="perplextaCore" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6ee7b7"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <filter id="subtleGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Base Rounded Container -->
+  <rect width="512" height="512" rx="112" fill="url(#perplextaBg)"/>
+
+  <!-- Subtle Ambient Ring -->
+  <circle cx="256" cy="256" r="190" fill="none" stroke="url(#perplextaEmerald)" stroke-width="2" stroke-opacity="0.2"/>
+
+  <!-- Outer Geometric Precision Hexagon -->
+  <polygon points="256,88 404,173 404,339 256,424 108,339 108,173" 
+           fill="none" 
+           stroke="url(#perplextaEmerald)" 
+           stroke-width="24" 
+           stroke-linejoin="round" 
+           stroke-linecap="round"/>
+
+  <!-- Inner Strategic Node Shield -->
+  <polygon points="256,148 350,202 350,310 256,364 162,310 162,202" 
+           fill="none" 
+           stroke="url(#perplextaEmerald)" 
+           stroke-width="12" 
+           stroke-opacity="0.6" 
+           stroke-linejoin="round"/>
+
+  <!-- Core Strategic Intelligence Hub -->
+  <circle cx="256" cy="256" r="54" fill="url(#perplextaCore)"/>
+  <circle cx="256" cy="256" r="24" fill="#181715"/>
+  <circle cx="256" cy="256" r="10" fill="#34d399"/>
+</svg>

@@ -1,0 +1,337 @@
+import express from 'express';
+import { authenticateToken } from '../middleware/auth.js';
+import { chatLimiter } from '../middleware/rateLimit.js';
+import { verifyBillingFunds } from '../middleware/billing.js';
+import { executeTaskLogic } from '../services/orchestrator.js';
+import { pool } from '../db/index.js';
+import { io } from '../config/socket.js';
+import { User, Subscription } from '../db/types.js';
+import { getProviderKey } from '../services/ai.js';
+import { getCachedOrchestratorConfig } from '../db/queries.js';
+import { saveGeneratedAudioToDisk } from '../services/files.js';
+import { checkAndIncrementQuota } from '../services/quota.js';
+
+const router = express.Router();
+
+/**
+ * Interface representing the structured file attachment metadata for tool execution.
+ */
+export interface ToolFileAttachment {
+  name: string;
+  type: string;
+  data: string; // Base64 encoded string containing file contents
+}
+
+/**
+ * Interface detailing the exact parameters accepted by the `/api/tools/execute-task` endpoint.
+ */
+export interface ExecuteToolRequestBody {
+  tool_id: string; // The canonical ID of the tool (e.g. perplexta_analysis, sovereign_search, etc.)
+  prompt: string;  // The query or prompt input to analyze
+  chat_id?: string | number; // Optional active chat session ID
+  socketId?: string; // Optional real-time socket ID for streaming chunks back
+  file_data?: ToolFileAttachment; // Optional file payload (e.g. PDF bridge attachment)
+  system_prompt?: string; // Optional custom system instructions override
+  image_settings?: any; // Context-specific generation parameters for image synthesis
+  video_settings?: any; // Context-specific generation parameters for video synthesis
+  audio_settings?: any; // Context-specific parameters for TTS or vocal synthesis
+}
+
+/**
+ * Structure of the successful tool completion response payload.
+ */
+export interface ToolExecutionResponse {
+  result: string; // The distilled natural language response text
+  citations?: any[]; // Search citations or information sources retrieved
+  walletCharged?: boolean; // Indicates if ledger balance deduction occurred
+}
+
+/**
+ * POST /api/tools/execute-task
+ * Orchestration executor endpoint for executing specialized AI and digital intelligence tools.
+ * Serves as the single, fully-typed source of truth for programmatic tool invocation.
+ */
+router.post("/execute-task", authenticateToken, chatLimiter, verifyBillingFunds, async (req: express.Request & { user?: any }, res: express.Response) => {
+  const userId = req.user?.id;
+  try {
+    const subRes = (await pool.query(`
+      SELECT s.status, u.role
+      FROM users u 
+      LEFT JOIN subscriptions s ON u.id = s.user_id AND s.status = 'active' AND (s.current_period_end IS NULL OR s.current_period_end > CURRENT_TIMESTAMP)
+      WHERE u.id = $1
+      ORDER BY s.current_period_end DESC NULLS LAST
+      LIMIT 1
+    `, [userId])) as { rows: { status: Subscription['status'] | null; role: User['role'] }[] };
+    
+    const row = subRes.rows[0];
+    const role = row?.role;
+    
+    const hasActiveSub = (role === 'admin' || (row && row.status === 'active'));
+    if (!hasActiveSub) {
+      return res.status(403).json({ 
+        error: 'subscription_required', 
+        code: 'PLAN_REQUIRED',
+        message: 'يرجى اختيار باقة اشتراك لتنفيذ هذه الأداة.',
+        message_en: 'An active subscription is required to execute tools.',
+        redirect: '/subscription'
+      });
+    }
+
+    const { socketId } = req.body as ExecuteToolRequestBody;
+
+    let targetSocket = socketId ? io?.sockets.sockets.get(socketId) : null;
+
+    const onChunk = (chunk: string) => {
+      if (targetSocket) {
+        targetSocket.emit("chat_chunk", { chunk });
+      } else {
+        try {
+          if (!res.writableEnded && !res.finished) {
+            res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
+          }
+        } catch (_) {}
+      }
+    };
+
+    if (!targetSocket) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.on('error', (err) => {
+        console.info('[Tools SSE] Managed stream write error:', err.message);
+      });
+    }
+
+    const result = await executeTaskLogic(req.body, userId, req, onChunk, targetSocket);
+    
+    if (targetSocket) {
+      targetSocket.emit("chat_response", result);
+      res.json({ success: true });
+    } else {
+      try {
+        if (!res.writableEnded && !res.finished) {
+          res.write(`data: ${JSON.stringify({ result })}\n\n`);
+          res.end();
+        }
+      } catch (_) {}
+    }
+  } catch (error: any) {
+    let isSystemInactive = false;
+    try {
+      const parsedErr = JSON.parse(error.message);
+      if (parsedErr && parsedErr.type === 'SYSTEM_INACTIVE') {
+        isSystemInactive = true;
+      }
+    } catch (_) {}
+
+    if (isSystemInactive) {
+      console.info(`[ToolsRoute] Service temporarily suspended or inactive tool processed gracefully for user: ${userId}`);
+    } else {
+      console.error('[ToolsRoute] Error:', error);
+    }
+    let userMessage = 'System error occurred. Please try again later.';
+    try {
+      const parsed = JSON.parse(error.message);
+      
+      let userLang = 'en';
+      try {
+        const uRes = (await pool.query('SELECT language FROM users WHERE id = $1', [userId])) as { rows: { language: User['language'] }[] };
+        if (uRes.rows.length > 0) userLang = uRes.rows[0].language || 'en';
+      } catch (_) {}
+      
+      if (userLang === 'ar' && parsed.error_ar) {
+        userMessage = parsed.error_ar;
+      } else if (parsed.error) {
+        userMessage = parsed.error;
+      }
+    } catch (_) {
+      if (error.message && (error.message.includes('provider') || error.message.includes('quota') || error.message.includes('Unauthorized'))) {
+        userMessage = error.message;
+      }
+    }
+    const isQuotaError = userMessage.includes('quota') || userMessage.includes('recharge') || userMessage.includes('رصيد') || userMessage.includes('باقة');
+    res.status(isQuotaError ? 400 : 500).json({ error: userMessage });
+  }
+});
+
+/**
+ * POST /api/tools/generate-music
+ * High-performance, secure endpoint to invoke Google GenAI Lyria music generation models.
+ */
+router.post("/generate-music", authenticateToken, chatLimiter, verifyBillingFunds, async (req: express.Request & { user?: any }, res: express.Response) => {
+  const userId = req.user?.id;
+  try {
+    const { prompt, model, lyrics: userLyrics } = req.body;
+    if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+      return res.status(400).json({ error: 'A valid text prompt is required for music generation.' });
+    }
+
+    const subRes = (await pool.query(`
+      SELECT s.status, u.role
+      FROM users u 
+      LEFT JOIN subscriptions s ON u.id = s.user_id AND s.status = 'active' AND (s.current_period_end IS NULL OR s.current_period_end > CURRENT_TIMESTAMP)
+      WHERE u.id = $1
+      ORDER BY s.current_period_end DESC NULLS LAST
+      LIMIT 1
+    `, [userId])) as { rows: { status: Subscription['status'] | null; role: User['role'] }[] };
+    
+    const row = subRes.rows[0];
+    const role = row?.role;
+    
+    const hasActiveSub = (role === 'admin' || (row && row.status === 'active'));
+    if (!hasActiveSub) {
+      return res.status(403).json({ 
+        error: 'subscription_required', 
+        code: 'PLAN_REQUIRED',
+        message: 'يرجى اختيار باقة اشتراك لتوليد الموسيقى.',
+        message_en: 'An active subscription is required to generate music.',
+        redirect: '/subscription'
+      });
+    }
+
+    const quotaCheck = await checkAndIncrementQuota(userId, 'perplexta_music');
+    if (!quotaCheck.allowed) {
+      if (quotaCheck.period === 'plan_required') {
+        return res.status(403).json({
+          error: 'Please select a subscription plan to generate music.',
+          error_ar: 'يرجى اختيار باقة اشتراك لتوليد الموسيقى والأغاني.',
+          type: 'PLAN_REQUIRED',
+          redirect: '/subscription'
+        });
+      }
+      const period = quotaCheck.period || 'daily';
+      const periodEn = period === 'daily' ? 'Daily' : 'Monthly';
+      const periodAr = period === 'daily' ? 'اليومي' : 'الشهري';
+      return res.status(402).json({
+        error: `You have reached the ${periodEn} limit for Music & Songs`,
+        error_ar: `لقد استنفدت الحد ${periodAr} المتاح لأداة الموسيقى والأغاني`,
+        redirect: '/subscription'
+      });
+    }
+
+    const config = await getCachedOrchestratorConfig('perplexta_music');
+    if (!config) {
+      return res.status(400).json({
+        error: 'Tool perplexta_music is not configured in the Orchestrator.',
+        error_ar: 'الآداة perplexta_music غير مهيأة في نظام الأوركسترا.'
+      });
+    }
+    
+    let provider = config.primary_provider;
+    let modelName = config.primary_model;
+    
+    if ((!provider || !modelName) && config.fallback_1_provider && config.fallback_1_model) {
+       provider = config.fallback_1_provider;
+       modelName = config.fallback_1_model;
+    }
+
+    if (!provider || !modelName) {
+      return res.status(400).json({
+        error: 'Tool perplexta_music has no provider or model configured in Orchestrator settings.',
+        error_ar: 'أداة الموسيقى (perplexta_music) غير مقترنة بمزود أو نموذج في إعدادات الأوركسترا.'
+      });
+    }
+
+    let apiKey = await getProviderKey(provider);
+    
+    if (!apiKey && config.fallback_1_provider) {
+       provider = config.fallback_1_provider;
+       modelName = config.fallback_1_model;
+       apiKey = await getProviderKey(provider);
+    }
+
+    if (!apiKey) {
+      return res.status(400).json({ 
+        error: 'API key for music generation provider not configured or not found in system vault.',
+        error_ar: 'مفتاح مزود الخدمة لتوليد الموسيقى غير مهيأ أو غير متوفر في خزينة النظام.'
+      });
+    }
+
+    const { GoogleGenAI } = await import("@google/genai");
+    const ai = new GoogleGenAI({ apiKey });
+
+    let fullPrompt = prompt;
+    if (userLyrics && typeof userLyrics === 'string' && userLyrics.trim()) {
+      fullPrompt = `${prompt}\n\nLyrics:\n${userLyrics}`;
+    }
+
+    const response = await ai.models.generateContentStream({
+      model: modelName,
+      contents: fullPrompt,
+      config: {
+        responseModalities: ["AUDIO"]
+      }
+    });
+
+    let audioBase64 = "";
+    let lyrics = "";
+    let mimeType = "audio/wav";
+
+    for await (const chunk of response) {
+      const parts = chunk.candidates?.[0]?.content?.parts;
+      if (!parts) continue;
+
+      for (const part of parts) {
+        if (part.inlineData?.data) {
+          if (!audioBase64 && part.inlineData.mimeType) {
+            mimeType = part.inlineData.mimeType;
+          }
+          audioBase64 += part.inlineData.data;
+        }
+        if (part.text && !lyrics) {
+          lyrics = part.text;
+        }
+      }
+    }
+
+    if (!audioBase64) {
+      throw new Error("No audio track was produced by the Google Lyria API. Please check your prompt instructions.");
+    }
+
+    res.json({
+      success: true,
+      audioBase64,
+      lyrics: lyrics || userLyrics || '',
+      mimeType,
+      model: modelName
+    });
+
+  } catch (error: any) {
+    console.error('[GenerateMusicRoute] Critical failure in music generation:', error);
+    res.status(500).json({ 
+      error: error.message || 'Music generation service encountered an unexpected error.',
+      error_ar: 'واجهت خدمة توليد الموسيقى خطأ غير متوقع أثناء المعالجة.'
+    });
+  }
+});
+
+/**
+ * POST /api/tools/save-music
+ * Saves generated AI music base64 track to disk and registers file metadata.
+ */
+router.post("/save-music", authenticateToken, async (req: express.Request & { user?: any }, res: express.Response) => {
+  const userId = req.user?.id;
+  const { audioBase64, mimeType, prompt, lyrics } = req.body;
+
+  if (!audioBase64) {
+    return res.status(400).json({ error: 'Missing audio base64 payload' });
+  }
+
+  try {
+    const fileUrl = await saveGeneratedAudioToDisk(
+      userId,
+      audioBase64,
+      mimeType || 'audio/wav',
+      prompt || 'AI_Music_Track',
+      lyrics || ''
+    );
+
+    res.json({ success: true, fileUrl });
+  } catch (error: any) {
+    console.error('[SaveMusicRoute] Failed to save track:', error);
+    res.status(500).json({ error: error.message || 'Failed to save generated audio track to library.' });
+  }
+});
+
+export default router;

@@ -1,0 +1,11 @@
+{
+  "name": "Perplexta",
+  "description": "Professional Elite Multimodal AI Platform featuring advanced forensic analysis and sovereign design system.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

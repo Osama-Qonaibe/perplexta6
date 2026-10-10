@@ -1,0 +1,105 @@
+/* ==========================================================================
+   PERPLEXTA COMPONENT TOKENS (Layer 3: Component-Level Binding)
+   Single source of truth for component button dimensions, shapes, and colors.
+   ========================================================================== */
+
+:root {
+  /* Button Primary Component Tokens */
+  --comp-button-primary-bg: var(--sys-color-primary);
+  --comp-button-primary-fg: var(--sys-color-on-primary);
+  --comp-button-primary-hover: color-mix(in srgb, var(--sys-color-primary) 88%, black);
+  --comp-button-shape: var(--sys-shape-sm);
+  --comp-button-min-touch: 44px;
+
+  /* Button Control Zones (Header, Input, Tool, Action) */
+  --btn-header-size: 32px;
+  --btn-header-radius: var(--sys-shape-sm);
+  --btn-header-border: var(--sys-color-outline);
+  --btn-header-bg: transparent;
+  --btn-header-hover: var(--sys-color-surface-variant);
+
+  --btn-input-size: 32px;
+  --btn-input-radius: var(--sys-shape-sm);
+  --btn-input-border: var(--sys-color-outline);
+  --btn-input-bg: transparent;
+  --btn-input-hover: var(--sys-color-surface-variant);
+
+  --btn-tool-size: 32px;
+  --btn-tool-radius: var(--sys-shape-sm);
+  --btn-tool-border: var(--sys-color-outline);
+  --btn-tool-bg: transparent;
+  --btn-tool-hover: var(--sys-color-surface-variant);
+
+  --btn-action-size: 32px;
+  --btn-action-radius: var(--sys-shape-sm);
+  --btn-action-border: var(--sys-color-outline);
+  --btn-action-bg: transparent;
+  --btn-action-hover: var(--sys-color-surface-variant);
+}
+
+:where(.dark, .dark *) {
+  /* Button Primary Component Tokens - Dark Mode */
+  --comp-button-primary-bg: var(--sys-color-primary);
+  --comp-button-primary-fg: var(--sys-color-on-primary);
+  --comp-button-primary-hover: color-mix(in srgb, var(--sys-color-primary) 85%, white);
+
+  /* Button Control Zones (Dark Mode) */
+  --btn-header-size: 32px;
+  --btn-header-radius: var(--sys-shape-sm);
+  --btn-header-border: var(--sys-color-outline);
+  --btn-header-bg: transparent;
+  --btn-header-hover: var(--sys-color-surface-variant);
+
+  --btn-input-size: 32px;
+  --btn-input-radius: var(--sys-shape-sm);
+  --btn-input-border: var(--sys-color-outline);
+  --btn-input-bg: transparent;
+  --btn-input-hover: var(--sys-color-surface-variant);
+
+  --btn-tool-size: 32px;
+  --btn-tool-radius: var(--sys-shape-sm);
+  --btn-tool-border: var(--sys-color-outline);
+  --btn-tool-bg: transparent;
+  --btn-tool-hover: var(--sys-color-surface-variant);
+
+  --btn-action-size: 32px;
+  --btn-action-radius: var(--sys-shape-sm);
+  --btn-action-border: var(--sys-color-outline);
+  --btn-action-bg: transparent;
+  --btn-action-hover: var(--sys-color-surface-variant);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not(.light) {
+    --comp-button-primary-bg: var(--sys-color-primary);
+    --comp-button-primary-fg: var(--sys-color-on-primary);
+    --comp-button-primary-hover: color-mix(in srgb, var(--sys-color-primary) 85%, white);
+  }
+}
+
+/* Mandatory M3 Touch Target (Minimum 44x44px bounding area) */
+.touch-target-44 {
+  min-height: 44px;
+  min-width: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.touch-target-44-expanded {
+  position: relative;
+}
+
+.touch-target-44-expanded::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  min-width: 44px;
+  min-height: 44px;
+  width: 100%;
+  height: 100%;
+}
+

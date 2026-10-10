@@ -1,0 +1,640 @@
+import { pool, ledgerPool } from '../db/index.js';
+import { io } from '../config/socket.js';
+import { getUserStorageUsage } from './files.js';
+import bcrypt from 'bcryptjs';
+import { walletLoader } from '../db/queries.js';
+import { invalidateUserCache } from '../middleware/auth.js';
+
+const TOOL_INFO: Record<string, { name_en: string, name_ar: string, desc_en: string, desc_ar: string }> = {
+  'chat_fast': {
+    name_en: 'Fast Chat',
+    name_ar: 'المحادثة السريعة',
+    desc_en: 'High-speed model operations and response generation.',
+    desc_ar: 'استجابات فائقة السرعة لسير العمل اليومي.'
+  },
+  'chat_pro': {
+    name_en: 'Pro Chat',
+    name_ar: 'المحادثة المتقدمة',
+    desc_en: 'High-fidelity contextual analysis and reasoning capabilities.',
+    desc_ar: 'تحليل دقيق ومناقشات فنية عميقة للمحترفين.'
+  },
+  'chat_reasoning': {
+    name_en: 'Thinking Chat',
+    name_ar: 'محادثة التفكير والتحليل',
+    desc_en: 'Deep multi-step cognitive processing and visual design logic.',
+    desc_ar: 'ذكاء مخصص للتفكير متعدد الخطوات وتصميم الحلول المعقدة.'
+  },
+  'perplexta_analysis': { 
+    name_en: 'Analysis', 
+    name_ar: 'تحليل',
+    desc_en: 'Deep AI-powered research and analysis.',
+    desc_ar: 'بحث وتحليل عميق مدعوم بالذكاء الاصطناعي.'
+  },
+  'ads_copilot': { 
+    name_en: 'Ads Copilot', 
+    name_ar: 'مساعد الإعلانات',
+    desc_en: 'Strategic campaign design and growth optimization for Meta, Google, TikTok, and ViralBook.',
+    desc_ar: 'تخطيط وصياغة الحملات الإعلانية واستراتيجيات النمو التجاري لمنصة فيرال بوك والمنصات العالمية.'
+  },
+  'image': { 
+    name_en: 'Image', 
+    name_ar: 'صورة',
+    desc_en: 'Create professional visual assets from text.',
+    desc_ar: 'أنشئ أصولاً بصرية احترافية من النصوص.'
+  },
+  'video': { 
+    name_en: 'Video', 
+    name_ar: 'فيديو',
+    desc_en: 'Cinematic AI video production from prompts.',
+    desc_ar: 'إنتاج فيديوهات سينمائية من الأوامر النصية.'
+  },
+  'stt': { 
+    name_en: 'Speech-to-Text', 
+    name_ar: 'تحويل الصوت لنص',
+    desc_en: 'High-precision audio transcription.',
+    desc_ar: 'نسخ صوتي بدقة عالية.'
+  },
+  'tts': { 
+    name_en: 'Text-to-Speech', 
+    name_ar: 'تحويل النص لصوت',
+    desc_en: 'Natural-sounding AI voice narration.',
+    desc_ar: 'سرد صوتي طبيعي مدعوم بالذكاء الاصطناعي.'
+  },
+  'code': { 
+    name_en: 'Code', 
+    name_ar: 'كود',
+    desc_en: 'Developer-grade coding and debugging.',
+    desc_ar: 'برمجة وتصحيح أخطاء بمستوى المطورين.'
+  },
+  'canvas': { 
+    name_en: 'Creative Canvas', 
+    name_ar: 'اللوحة الإبداعية',
+    desc_en: 'Collaborative AI design and brainstorming.',
+    desc_ar: 'تصميم وعصف ذهني تعاوني بالذكاء الاصطناعي.'
+  },
+  'sovereign_search': { 
+    name_en: 'Sovereign Search', 
+    name_ar: 'البحث السيادي',
+    desc_en: 'Global real-time web intelligence and strategic knowledge extraction.',
+    desc_ar: 'البحث الذكي العالمي في الوقت الفعلي واستخراج المعرفة الاستراتيجية.'
+  },
+  'x402_api': {
+    name_en: 'Agent Gateway (x402 API)',
+    name_ar: 'بوابة الـ API (x402)',
+    desc_en: 'AI analytics integration gateway for programmatic execution.',
+    desc_ar: 'بوابة برمجية متطورة لتكامل النماذج والتحليلات للوكلاء.'
+  },
+  'storage_mb': { 
+    name_en: 'Vault Storage', 
+    name_ar: 'سعة التخزين',
+    desc_en: 'Secure storage for your intelligence assets.',
+    desc_ar: 'تخزين آمن لأصولك الاستخباراتية.'
+  }
+};
+
+const ABSOLUTE_TOOLS = new Set(['storage_mb']);
+
+export async function getUserUsage(userId: string | number) {
+  if (!pool) throw new Error('Database initializing');
+
+  const [planRes, dailyUsageRes, monthlyUsageRes, storageUsageMB] = await Promise.all([
+    pool.query(`
+      SELECT u.role, p.id, p.name_en, p.name_ar, p.limits, p.color, s.status, s.billing_period, s.current_period_end, s.cycle_credits, s.used_credits, s.created_at as subscription_start
+      FROM users u
+      LEFT JOIN subscriptions s ON u.id = s.user_id
+      LEFT JOIN plans p ON p.id = s.plan_id
+      WHERE u.id = $1
+      ORDER BY CASE WHEN s.status = 'active' THEN 0 ELSE 1 END, s.current_period_end DESC NULLS LAST
+      LIMIT 1
+    `, [userId]),
+    pool.query(`
+      SELECT tool_id, usage_count
+      FROM user_usage
+      WHERE user_id = $1 AND usage_date = CURRENT_DATE
+    `, [userId]),
+    pool.query(`
+      SELECT tool_id, SUM(usage_count) as total
+      FROM user_usage
+      WHERE user_id = $1 AND usage_date >= date_trunc('month', CURRENT_DATE)
+      GROUP BY tool_id
+    `, [userId]),
+    getUserStorageUsage(userId.toString())
+  ]);
+
+  if (planRes.rows.length === 0) throw new Error('User profile not found');
+  
+  let plan = planRes.rows[0];
+  const userRole = plan.role;
+  const isAdmin = userRole === 'admin';
+  const hasActiveSub = plan.id && plan.status === 'active';
+
+  if (!isAdmin && !hasActiveSub) {
+    plan = {
+      ...plan,
+      id: null,
+      name_en: 'No Active Subscription',
+      name_ar: 'لا يوجد اشتراك نشط',
+      limits: {},
+      color: '#ef4444',
+      status: 'inactive',
+      billing_period: 'None',
+      current_period_end: null,
+      subscription_start: null
+    };
+  } else if (isAdmin && !plan.id) {
+    plan = {
+      ...plan,
+      id: -1,
+      name_en: 'Sovereign Administrator',
+      name_ar: 'الرئيس التنفيذي للمنصة',
+      limits: {},
+      color: '#334155',
+      status: 'active',
+      billing_period: 'Lifetime',
+      current_period_end: null,
+      subscription_start: null
+    };
+  }
+
+  const dailyUsageMap = dailyUsageRes.rows.reduce((acc: any, row: any) => {
+    acc[row.tool_id] = parseInt(row.usage_count);
+    return acc;
+  }, {});
+
+  const monthlyUsageMap = monthlyUsageRes.rows.reduce((acc: any, row: any) => {
+    acc[row.tool_id] = parseInt(row.total);
+    return acc;
+  }, {});
+
+  const ALLOWED_VISIBLE_TOOLS = [
+    'chat_fast',
+    'chat_pro',
+    'chat_reasoning',
+    'perplexta_analysis',
+    'ads_copilot',
+    'sovereign_search',
+    'image',
+    'video',
+    'stt',
+    'tts',
+    'code',
+    'canvas'
+  ];
+
+  const usageItems = ALLOWED_VISIBLE_TOOLS.map(toolId => {
+    const info = TOOL_INFO[toolId];
+    const isAbsolute = ABSOLUTE_TOOLS.has(toolId);
+
+    if (isAdmin && !hasActiveSub) {
+      let currentUsage = 0;
+      if (toolId === 'storage_mb') currentUsage = storageUsageMB;
+      else currentUsage = monthlyUsageMap[toolId] || 0;
+
+      return {
+        id: toolId,
+        name_en: info.name_en,
+        name_ar: info.name_ar,
+        desc_en: info.desc_en,
+        desc_ar: info.desc_ar,
+        usage: {
+          daily: isAbsolute ? currentUsage : (dailyUsageMap[toolId] || 0),
+          monthly: currentUsage,
+          ...(isAbsolute && { total: currentUsage })
+        },
+        limits: { daily: null, monthly: null }
+      };
+    }
+
+    const parsedLimits = typeof plan.limits === 'object' && plan.limits !== null ? plan.limits : (typeof plan.limits === 'string' ? JSON.parse(plan.limits || '{}') : {});
+    const rawLimits = parsedLimits?.[toolId] ?? null;
+    let dailyLimit: number | null = null;
+    let monthlyLimit: number | null = null;
+    let totalLimit: number | null = null;
+
+    if (!hasActiveSub) {
+      dailyLimit = 0;
+      monthlyLimit = 0;
+      totalLimit = isAbsolute ? 0 : null;
+    } else if (rawLimits === 'unlimited') {
+      dailyLimit = null;
+      monthlyLimit = null;
+    } else if (typeof rawLimits === 'object' && rawLimits !== null) {
+      dailyLimit   = rawLimits.daily   !== undefined ? parseInt(rawLimits.daily)   : null;
+      monthlyLimit = rawLimits.monthly !== undefined ? parseInt(rawLimits.monthly) : null;
+      totalLimit   = rawLimits.total   !== undefined ? parseInt(rawLimits.total)   : null;
+    } else if (rawLimits !== null && rawLimits !== undefined) {
+      const parsed = parseInt(rawLimits);
+      if (!isNaN(parsed)) {
+        dailyLimit = parsed;
+        monthlyLimit = parsed;
+      }
+    } else {
+      dailyLimit = 0;
+      monthlyLimit = 0;
+      totalLimit = isAbsolute ? 0 : null;
+    }
+
+    let dailyUsage: number;
+    let monthlyUsage: number;
+
+    if (toolId === 'storage_mb') {
+      dailyUsage = storageUsageMB;
+      monthlyUsage = storageUsageMB;
+    } else {
+      dailyUsage = dailyUsageMap[toolId] || 0;
+      monthlyUsage = monthlyUsageMap[toolId] || 0;
+    }
+
+    const result: any = {
+      id: toolId,
+      name_en: info.name_en,
+      name_ar: info.name_ar,
+      desc_en: info.desc_en,
+      desc_ar: info.desc_ar,
+      usage: {
+        daily: dailyUsage,
+        monthly: monthlyUsage
+      },
+      limits: {
+        daily: isAbsolute ? null : dailyLimit,
+        monthly: isAbsolute ? null : monthlyLimit
+      }
+    };
+
+    if (isAbsolute) {
+      result.usage.total = dailyUsage;
+      result.limits.total = totalLimit ?? dailyLimit; // fallback to dailyLimit if no explicit total
+    }
+
+    return result;
+  });
+
+  return {
+    plan: {
+      id: plan.id,
+      name_en: plan.name_en,
+      name_ar: plan.name_ar,
+      limits: plan.limits,
+      color: plan.color || '#334155',
+      status: plan.status || 'Active',
+      billing_period: plan.billing_period || 'Monthly',
+      current_period_end: plan.current_period_end,
+      subscription_start: plan.subscription_start
+    },
+    usage: usageItems
+  };
+}
+
+let columnsEnsured = false;
+export async function ensureUserProfileColumns() {
+  if (columnsEnsured || !pool) return;
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS cover_image TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS occupation TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS location TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS website_url TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_domain TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_domain_verified BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS social_links JSONB DEFAULT '{}';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_links JSONB DEFAULT '[]';
+    `);
+    columnsEnsured = true;
+  } catch (err: any) {
+    console.warn('[ensureUserProfileColumns] Notice/Warning while ensuring user profile columns:', err.message);
+  }
+}
+
+export async function getUserProfile(userId: string) {
+  if (!pool) throw new Error('Database initializing');
+  await ensureUserProfileColumns();
+  
+  const [result, wallet] = await Promise.all([
+    pool.query(`
+      SELECT u.id, u.name, u.email, u.role, u.avatar, u.cover_image, u.bio, u.occupation, u.location, u.website_url, u.custom_domain, u.is_domain_verified, u.social_links, u.verified_links, u.status, u.language, u.theme, u.custom_instructions, u.kyc_status, u.created_at, u.referral_code, u.media_muted, u.data_saver,
+             s.plan_id, s.status as sub_status, s.billing_period, s.current_period_end, s.cycle_credits, s.used_credits, p.name_en as plan_name_en, p.name_ar as plan_name_ar, p.color as plan_color, p.limits, p.daily_credits, p.monthly_credits, p.annual_credits
+      FROM users u
+      LEFT JOIN subscriptions s ON u.id = s.user_id AND s.status = 'active' AND (s.current_period_end IS NULL OR s.current_period_end > CURRENT_TIMESTAMP)
+      LEFT JOIN plans p ON s.plan_id = p.id
+      WHERE u.id = $1
+      ORDER BY s.current_period_end DESC NULLS LAST
+      LIMIT 1
+    `, [userId]),
+    walletLoader.load(userId)
+  ]);
+  
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  const activeWallet = wallet || { balance: 0.0, points: 0, referral_activated: false };
+  
+  let subscription = null;
+
+  if (row.plan_id && row.sub_status === 'active') {
+    const rawLimits = typeof row.limits === 'object' && row.limits !== null ? row.limits : (typeof row.limits === 'string' ? JSON.parse(row.limits || '{}') : {});
+    const cycleCredits = parseInt(row.cycle_credits || 0, 10);
+    const usedCredits = parseInt(row.used_credits || 0, 10);
+    const remainingCredits = Math.max(0, cycleCredits - usedCredits);
+    const usagePercentage = cycleCredits > 0 ? Math.min(100, Math.round((usedCredits / cycleCredits) * 100)) : 0;
+
+    subscription = {
+      plan_id: row.plan_id,
+      status: row.sub_status,
+      billing_period: row.billing_period || 'monthly',
+      current_period_end: row.current_period_end,
+      plan_name_en: row.plan_name_en,
+      plan_name_ar: row.plan_name_ar,
+      plan_color: row.plan_color,
+      cycle_credits: cycleCredits,
+      used_credits: usedCredits,
+      remaining_credits: remainingCredits,
+      usage_percentage: usagePercentage,
+      limits: rawLimits
+    };
+  } else {
+    try {
+      const freePlanRes = await pool.query(
+        "SELECT id, name_en, name_ar, color, monthly_credits, limits FROM plans WHERE is_active = true AND monthly_price = 0 ORDER BY id ASC LIMIT 1"
+      );
+      if (freePlanRes.rows.length > 0) {
+        const fp = freePlanRes.rows[0];
+        const rawLimits = typeof fp.limits === 'object' && fp.limits !== null ? fp.limits : (typeof fp.limits === 'string' ? JSON.parse(fp.limits || '{}') : {});
+        const cycleCredits = parseInt(fp.monthly_credits || 0, 10);
+        subscription = {
+          plan_id: fp.id,
+          status: 'active',
+          billing_period: 'monthly',
+          current_period_end: null,
+          plan_name_en: fp.name_en,
+          plan_name_ar: fp.name_ar,
+          plan_color: fp.color || '#334155',
+          cycle_credits: cycleCredits,
+          used_credits: 0,
+          remaining_credits: cycleCredits,
+          usage_percentage: 0,
+          limits: rawLimits,
+          is_free_tier: true
+        };
+      }
+    } catch (e: any) {
+      console.warn('[getUserProfile] Free plan fallback query error:', e.message);
+    }
+  }
+  
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    avatar: row.avatar,
+    cover_image: row.cover_image || null,
+    bio: row.bio || row.custom_instructions || '',
+    occupation: row.occupation || '',
+    location: row.location || '',
+    website_url: row.website_url || '',
+    custom_domain: row.custom_domain || '',
+    is_domain_verified: !!row.is_domain_verified,
+    social_links: typeof row.social_links === 'object' && row.social_links !== null ? row.social_links : (typeof row.social_links === 'string' ? JSON.parse(row.social_links || '{}') : {}),
+    verified_links: Array.isArray(row.verified_links) ? row.verified_links : (typeof row.verified_links === 'string' ? JSON.parse(row.verified_links || '[]') : []),
+    status: row.status,
+    language: row.language,
+    theme: row.theme,
+    custom_instructions: row.custom_instructions,
+    kyc_status: row.kyc_status,
+    created_at: row.created_at,
+    referral_code: row.referral_code,
+    media_muted: row.media_muted !== undefined && row.media_muted !== null ? !!row.media_muted : true,
+    data_saver: row.data_saver !== undefined && row.data_saver !== null ? !!row.data_saver : false,
+    custom_limits: {},
+    subscription,
+    balance: activeWallet.balance,
+    points: parseInt(activeWallet.points),
+    referral_activated: !!activeWallet.referral_activated
+  };
+}
+
+export async function updateUserProfile(userId: string | number, data: any) {
+  if (!pool) throw new Error('Database initializing');
+  await ensureUserProfileColumns();
+  
+  const {
+    name, avatar, cover_image, bio, occupation, location, website_url,
+    custom_domain, is_domain_verified, social_links, verified_links,
+    language, theme, custom_instructions, password, email,
+    email_notifications, media_muted, data_saver
+  } = data;
+
+  const updates: string[] = [];
+  const values: any[] = [];
+  let idx = 1;
+
+  if (cover_image !== undefined) {
+    updates.push(`cover_image = $${idx++}`);
+    values.push(cover_image);
+  }
+
+  if (bio !== undefined) {
+    updates.push(`bio = $${idx++}`);
+    values.push(bio);
+    updates.push(`custom_instructions = $${idx++}`);
+    values.push(bio);
+  }
+
+  if (occupation !== undefined) {
+    updates.push(`occupation = $${idx++}`);
+    values.push(occupation);
+  }
+
+  if (location !== undefined) {
+    updates.push(`location = $${idx++}`);
+    values.push(location);
+  }
+
+  if (website_url !== undefined) {
+    updates.push(`website_url = $${idx++}`);
+    values.push(website_url);
+  }
+
+  if (custom_domain !== undefined) {
+    updates.push(`custom_domain = $${idx++}`);
+    values.push(custom_domain);
+  }
+
+  if (is_domain_verified !== undefined) {
+    updates.push(`is_domain_verified = $${idx++}`);
+    values.push(!!is_domain_verified);
+  }
+
+  if (social_links !== undefined) {
+    updates.push(`social_links = $${idx++}`);
+    values.push(typeof social_links === 'object' ? JSON.stringify(social_links) : social_links);
+  }
+
+  if (verified_links !== undefined) {
+    updates.push(`verified_links = $${idx++}`);
+    values.push(typeof verified_links === 'object' ? JSON.stringify(verified_links) : verified_links);
+  }
+
+  if (data_saver !== undefined) {
+    if (typeof data_saver !== 'boolean') throw new Error('Data saver preference must be a boolean');
+    updates.push(`data_saver = $${idx++}`);
+    values.push(data_saver);
+  }
+
+  if (email_notifications !== undefined) {
+    if (typeof email_notifications !== 'boolean') throw new Error('Email notifications must be a boolean');
+    updates.push(`email_notifications = $${idx++}`);
+    values.push(email_notifications);
+  }
+
+  if (media_muted !== undefined) {
+    if (typeof media_muted !== 'boolean') throw new Error('Media muted preference must be a boolean');
+    updates.push(`media_muted = $${idx++}`);
+    values.push(media_muted);
+  }
+
+  if (name !== undefined) {
+    if (name !== null && typeof name !== 'string') throw new Error('Name must be a string');
+    updates.push(`name = $${idx++}`);
+    values.push(name);
+  }
+
+  if (avatar !== undefined) {
+    if (avatar !== null && typeof avatar !== 'string') throw new Error('Avatar URL must be a string');
+    updates.push(`avatar = $${idx++}`);
+    values.push(avatar);
+  }
+
+  if (data.avatar_asset_id !== undefined) {
+    updates.push(`avatar_asset_id = $${idx++}`);
+    values.push(data.avatar_asset_id);
+  }
+
+  if (language !== undefined) {
+    if (typeof language !== 'string') throw new Error('Language must be a string');
+    const cleanLang = language.trim().toLowerCase();
+    if (cleanLang !== 'en' && cleanLang !== 'ar') throw new Error('Invalid language specified. Must be "en" or "ar".');
+    updates.push(`language = $${idx++}`);
+    values.push(cleanLang);
+  }
+
+  if (theme !== undefined) {
+    if (typeof theme !== 'string') throw new Error('Theme must be a string');
+    const cleanTheme = theme.trim().toLowerCase();
+    if (cleanTheme !== 'light' && cleanTheme !== 'dark') throw new Error('Invalid theme specified. Must be "light" or "dark".');
+    updates.push(`theme = $${idx++}`);
+    values.push(cleanTheme);
+  }
+
+  if (custom_instructions !== undefined && bio === undefined) {
+    if (custom_instructions !== null && typeof custom_instructions !== 'string') throw new Error('Custom instructions must be a string');
+    updates.push(`custom_instructions = $${idx++}`);
+    values.push(custom_instructions);
+  }
+
+  if (email !== undefined) {
+    if (typeof email !== 'string') throw new Error('Email must be a string');
+    const cleanEmail = email.trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanEmail)) throw new Error('Invalid email format');
+    const emailCheck = await pool.query('SELECT id FROM users WHERE email = $1 AND id != $2', [cleanEmail, userId]);
+    if (emailCheck.rows.length > 0) throw new Error('Email is already in use by another account');
+    updates.push(`email = $${idx++}`);
+    values.push(cleanEmail);
+  }
+  
+  if (password !== undefined && password !== '') {
+    if (typeof password !== 'string') throw new Error('Password must be a string');
+    if (password.length < 8) throw new Error('Password must be at least 8 characters long');
+    const hash = await bcrypt.hash(password, 10);
+    updates.push(`password_hash = $${idx++}`);
+    values.push(hash);
+  }
+
+  const userIdStr = userId.toString();
+  if (updates.length === 0) return await getUserProfile(userIdStr);
+
+  values.push(userIdStr);
+  const query = `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${idx} RETURNING *`;
+  await pool.query(query, values);
+  
+  // Invalidate caches to ensure next fetch (on refresh) gets latest theme/data
+  invalidateUserCache(userIdStr);
+  
+  if (io) io.to(`user_${userIdStr}`).emit('user_profile_updated');
+
+  return await getUserProfile(userIdStr);
+}
+
+export async function getUserMediaPreferences(userId: number | string) {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_media_preferences (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        media_type VARCHAR(50) NOT NULL,
+        aspect_ratio VARCHAR(20) NOT NULL DEFAULT '16:9',
+        settings JSONB DEFAULT '{}',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_user_media_preferences UNIQUE (user_id, media_type)
+      )
+    `);
+
+    const res = await pool.query(
+      `SELECT media_type, aspect_ratio, settings, updated_at 
+       FROM user_media_preferences 
+       WHERE user_id = $1`,
+      [userId]
+    );
+
+    const prefs: Record<string, { aspectRatio: string; settings: any; updatedAt: string }> = {};
+    for (const row of res.rows) {
+      prefs[row.media_type] = {
+        aspectRatio: row.aspect_ratio,
+        settings: row.settings || {},
+        updatedAt: row.updated_at
+      };
+    }
+    return prefs;
+  } catch (err: any) {
+    console.error('[getUserMediaPreferences] Error fetching preferences:', err.message);
+    return {};
+  }
+}
+
+export async function saveUserMediaPreference(
+  userId: number | string, 
+  mediaType: string, 
+  aspectRatio: string, 
+  settings: any = {}
+) {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_media_preferences (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        media_type VARCHAR(50) NOT NULL,
+        aspect_ratio VARCHAR(20) NOT NULL DEFAULT '16:9',
+        settings JSONB DEFAULT '{}',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_user_media_preferences UNIQUE (user_id, media_type)
+      )
+    `);
+
+    const res = await pool.query(
+      `INSERT INTO user_media_preferences (user_id, media_type, aspect_ratio, settings, updated_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id, media_type)
+       DO UPDATE SET 
+         aspect_ratio = EXCLUDED.aspect_ratio,
+         settings = EXCLUDED.settings,
+         updated_at = CURRENT_TIMESTAMP
+       RETURNING media_type, aspect_ratio, settings, updated_at`,
+      [userId, mediaType, aspectRatio, typeof settings === 'object' ? JSON.stringify(settings) : '{}']
+    );
+    return res.rows[0];
+  } catch (err: any) {
+    console.error('[saveUserMediaPreference] Error saving media preference:', err.message);
+    throw err;
+  }
+}

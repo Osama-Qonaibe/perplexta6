@@ -1,0 +1,70 @@
+{
+  "name": "Perplexta Platform - Elite AI Orchestration",
+  "short_name": "Perplexta",
+  "description": "Professional Elite Technical Analysis & AI Orchestration Platform with Dual-Database Architecture.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "orientation": "any",
+  "categories": ["productivity", "utilities", "artificial intelligence", "finance", "business"],
+  "icons": [
+    {
+      "src": "/uploads/brand/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/uploads/brand/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/uploads/brand/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/uploads/brand/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "New Chat",
+      "short_name": "Chat",
+      "description": "Start a fresh AI session",
+      "url": "/chat",
+      "icons": [{ "src": "/uploads/brand/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Bulletin Board",
+      "short_name": "Bulletin",
+      "description": "Explore ads, reels & community posts",
+      "url": "/bulletin",
+      "icons": [{ "src": "/uploads/brand/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Explore",
+      "short_name": "Explore",
+      "description": "Discover categories and recommendations",
+      "url": "/discover",
+      "icons": [{ "src": "/uploads/brand/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Rewards Center",
+      "short_name": "Rewards",
+      "description": "Manage points & rewards",
+      "url": "/rewards",
+      "icons": [{ "src": "/uploads/brand/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}

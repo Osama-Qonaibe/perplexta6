@@ -1,0 +1,3617 @@
+import { secureStorage } from "@/lib/storage";
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { io, Socket } from 'socket.io-client';
+import { toast } from '@/design-system';
+import { API_BASE_URL, SOCKET_URL } from '../constants';
+import { applyNonce } from '../utils/csp';
+import { performSilentTokenRefresh } from '../lib/axios';
+import { useQueryClient } from '@tanstack/react-query';
+import { SessionPurge } from '../utils/SessionPurge';
+export type Theme = 'dark' | 'light' | 'system';
+import { ThemeSync } from '../utils/ThemeSync';
+import { applyLanguageFont, FontLoadingConfig, FontLanguageConfig } from '../utils/fontLoader';
+import { resolveImageUrl } from '../utils/imageResolver';
+import { updateDocumentHeadIcons } from '../utils/assetManager';
+import { trackLoginEvent, trackSignUpEvent } from '../utils/analytics';
+import { detectStandaloneWebview, StandaloneWebviewDetection } from '../hooks/usePwaInstall';
+
+type Language = 'ar' | 'en';
+
+export interface User {
+  id?: number;
+  name: string;
+  email: string;
+  avatar?: string;
+  cover_image?: string | null;
+  bio?: string;
+  occupation?: string;
+  location?: string;
+  website_url?: string;
+  custom_domain?: string;
+  is_domain_verified?: boolean;
+  social_links?: {
+    facebook?: string;
+    instagram?: string;
+    linkedin?: string;
+    twitter?: string;
+    whatsapp?: string;
+    youtube?: string;
+    github?: string;
+    website?: string;
+    [key: string]: string | undefined;
+  };
+  verified_links?: string[];
+  role?: string;
+  kyc_required?: boolean;
+  kyc_status?: 'pending' | 'verified' | 'rejected' | 'none';
+  kyc_rejection_reason?: string | null;
+  custom_instructions?: string;
+  referral_code?: string;
+  memory?: string;
+  points?: number;
+  balance?: number;
+  email_notifications?: boolean;
+  media_muted?: boolean;
+  data_saver?: boolean;
+  subscription?: {
+    plan_id: string;
+    status: string;
+    created_at?: string;
+    current_period_end: string;
+    last_period_start?: string;
+    plan_name_en: string;
+    plan_name_ar?: string;
+    billing_period?: string;
+    cycle_credits?: number;
+    used_credits?: number;
+    remaining_credits?: number;
+    usage_percentage?: number;
+    limits: any;
+    plan_color?: string;
+  } | null;
+  usageStats?: Record<string, number>;
+}
+
+export interface SiteSettings {
+  siteName: string;
+  siteNameAr: string;
+  seoSiteNameEn?: string;
+  seoSiteNameAr?: string;
+  siteDescription: string;
+  siteDescriptionAr: string;
+  logoBase64: string | null;
+  logoLightBase64: string | null;
+  faviconBase64: string | null;
+  seoDescriptionEn: string;
+  seoDescriptionAr: string;
+  keywordsEn: string;
+  keywordsAr: string;
+  googleAnalyticsId: string;
+  googleSiteVerification: string;
+  seoImageUrl: string | null;
+  blocked_paths?: string;
+  fontLoadingConfig?: FontLoadingConfig | null;
+  fontConfigAr?: FontLanguageConfig | null;
+  fontConfigEn?: FontLanguageConfig | null;
+}
+
+interface AppContextType {
+  language: Language;
+  setLanguage: (lang: Language) => void;
+  theme: Theme;
+  setTheme: (theme: Theme) => void;
+  resolvedTheme: 'dark' | 'light';
+  themeTransitioning: boolean;
+  languageTransitioning: boolean;
+  dir: 'rtl' | 'ltr';
+  t: (key: string, replacements?: Record<string, string | number>) => string;
+  isSidebarOpen: boolean;
+  setIsSidebarOpen: (isOpen: boolean) => void;
+  user: User | null;
+  setUser: (user: User | null) => void;
+  isAuthReady: boolean;
+  token: string | null;
+  balance: number;
+  balanceUSD: number;
+  login: (email: string, password: string) => Promise<{ success: boolean, error?: string }>;
+  signup: (email: string, password: string, name: string, ref?: string) => Promise<{ success: boolean, error?: string }>;
+  loginWithGoogle: () => void;
+  logout: (forceRedirect?: boolean) => void;
+  purgeSession: (forceRedirect?: boolean) => void;
+  isAuthModalOpen: boolean;
+  setIsAuthModalOpen: (isOpen: boolean) => void;
+  plans: any[];
+  setPlans: (plans: any[]) => void;
+  plansLoaded: boolean;
+  siteSettings: SiteSettings;
+  setSiteSettings: (settings: SiteSettings) => void;
+  economySettings: any;
+  setEconomySettings: (settings: any) => void;
+  payWithBalance: (planId: string, billingCycle: 'monthly' | 'annual' | 'daily') => Promise<{ success: boolean, message?: string, error?: string }>;
+  stripeCheckout: (planId: string, billingCycle: 'monthly' | 'annual' | 'daily') => Promise<{ url?: string, error?: string }>;
+  refreshUser: () => Promise<any>;
+  notifications: any[];
+  setNotifications: (notifications: any[]) => void;
+  unreadCount: number;
+  markAsRead: (id: number) => Promise<void>;
+  markAllAsRead: () => Promise<void>;
+  deleteNotification: (id: number) => Promise<void>;
+  clearAllNotifications: () => Promise<void>;
+  socket: Socket | null;
+  milestoneData: any;
+  setMilestoneData: (data: any) => void;
+  isMobile: boolean;
+  isIOS: boolean;
+  isStandaloneWebview: boolean;
+  isWebview: boolean;
+  isPwaStandalone: boolean;
+  isStandardBrowser: boolean;
+  rememberMe: boolean;
+  isOperationPending: boolean;
+  setIsOperationPending: (val: boolean) => void;
+  setRememberMe: (val: boolean) => void;
+  memoryNotification: {
+    isVisible: boolean;
+    type: 'success' | 'warning' | 'cleanup' | 'optimization' | 'startup';
+    desc?: string;
+  };
+  triggerMemoryNotification: (type: 'success' | 'warning' | 'cleanup' | 'optimization' | 'startup', desc?: string) => void;
+  closeMemoryNotification: () => void;
+  upgradePromptState: {
+    isOpen: boolean;
+    toolId: string;
+    limit?: number;
+    currentUsage?: number;
+    period?: 'daily' | 'monthly';
+  };
+  setUpgradePromptState: (state: any) => void;
+  triggerUpgradePrompt: (toolId: string, limit?: number, currentUsage?: number, period?: 'daily' | 'monthly') => void;
+  closeUpgradePrompt: () => void;
+  showInactivityWarning: boolean;
+  setShowInactivityWarning: (val: boolean) => void;
+  inactivityCountdown: number;
+  setInactivityCountdown: (val: number) => void;
+  extendSession: () => void;
+  logUserActivity: (eventType: string, eventDetails?: any) => Promise<void>;
+}
+
+const translations = {
+  ar: {
+    rewards: 'المكافآت',
+    subscription: 'الاشتراكات',
+    consumption: 'الاستهلاك',
+    inactivityWarningTitle: 'جلسة العمل على وشك الانتهاء',
+    sessionExpiringTitle: 'تنتهي الجلسة قريباً',
+    sessionExpiringMessage: 'ستنتهي جلستك خلال 5 دقائق. يرجى تحديث الصفحة أو إعادة تسجيل الدخول للبقاء متصلاً.',
+    refreshNow: 'تحديث الآن',
+    inactivityWarningDesc: 'لقد كنت غير نشط لفترة من الوقت. لحماية حسابك وأمان بياناتك، سيتم تسجيل خروجك تلقائياً خلال {seconds} ثانية.',
+    stayLoggedInBtn: 'البقاء متصلاً',
+    logoutNowBtn: 'تسجيل الخروج الآن',
+    usageRadar: 'رادار الاستهلاك',
+    realTimeUsageSync: 'مزامنة لحظية للموارد',
+    dashboard: 'لوحة التحكم',
+    newChat: 'محادثة جديدة',
+    settings: 'الإعدادات',
+    askAssistant: 'اسأل أو أرسل أمرك...',
+    fast: 'سريع',
+    pro: 'احترافي',
+    thinking: 'تفكير',
+    uploadImage: 'رفع صورة',
+    uploadDocument: 'رفع مستند',
+    chat: 'محادثة',
+    tools: 'الأدوات',
+    chat_fast: 'المحادثة السريعة',
+    chat_pro: 'المحادثة المتقدمة',
+    chat_reasoning: 'نمط التفكير العميق',
+    sovereign_search: 'البحوث والدراسات',
+    sovereign_search_desc: 'تفكيك وتركيب البحوث والدراسات الأكاديمية والمراجعة المنهجية.',
+    perplexta_analysis: 'تحليل وتدقيق',
+    perplexta_analysis_desc: 'تحليل وتدقيق المستندات والملفات والصور والبيانات.',
+    ads_copilot: 'مساعد الإعلانات',
+    ads_copilot_desc: 'تخطيط وصياغة الحملات الإعلانية واستراتيجيات النمو التجاري لمنصة فيرال بوك والمنصات العالمية.',
+    image: 'توليد الصور',
+    video: 'توليد الفيديو',
+    code: 'استوديو الكود (IDE)',
+    audio_studio: 'استوديو الصوت والإنتاج',
+    audio_studio_desc: 'تأليف وإنتاج الأصوات والموسيقى المتقدمة.',
+    stt: 'تحويل الصوت الى نص (STT)',
+    tts: 'تحويل النص الى صوت (TTS)',
+    perplexta_music: 'التأليف الموسيقي',
+    perplexta_music_desc: 'التأليف الصوتي المتقدم والتركيب الموسيقي الهيكلي.',
+    storage_mb: 'مساحة التخزين (MB)',
+    x402_api: 'بوابة المطورين (x402 API)',
+    x402_api_desc: 'تحسين توجيه النماذج الذكية والتحليلات الديناميكية المحمية ببروتوكول x402 للوكلاء البرمجيين.',
+    newBadge: 'جديد',
+    commandCenter: 'مركز القيادة',
+    referralDashboard: 'لوحة الإحالات',
+    aiInfrastructure: 'إدارة المفاتيح',
+    dbOrchestration: 'قواعد البيانات',
+    financeVault: 'الخزنة المالية',
+    financeVaultDesc: 'إدارة الإعدادات الاقتصادية، بوابات الدفع، وعمليات السحب.',
+    economySettings: 'الإعدادات الاقتصادية',
+    plansSubscriptions: 'الخطط والاشتراكات',
+    saveSettings: 'حفظ الإعدادات',
+    minWithdrawal: 'الحد الأدنى للسحب (سنت)',
+    minWithdrawalDesc: 'أقل مبلغ يمكن للمستخدم طلبه للسحب.',
+    referralBonus: 'مكافأة الإحالة (نقاط)',
+    referralBonusDesc: 'النقاط التي يحصل عليها المُحيل.',
+    welcomeBonus: 'مكافأة الترحيب (نقاط)',
+    welcomeBonusDesc: 'النقاط التي يحصل عليها المستخدم الجديد.',
+    conversionRate: 'سعر التحويل',
+    conversionRateDesc: 'قيمة النقطة الواحدة بالدولار.',
+    pointsPerDollar: 'النقاط لكل دولار',
+    pointsPerDollarDesc: 'عدد النقاط التي يحصل عليها المستخدم مقابل كل دولار.',
+    points: 'نقاط',
+    point: 'نقطة',
+    cents: 'سنت',
+    stripeConfig: 'إعدادات Stripe',
+    stripeDesc: 'إدارة مفاتيح API الخاصة بـ Stripe للاشتراكات والمدفوعات.',
+    testMode: 'وضع التجربة',
+    liveMode: 'وضع التشغيل',
+    publishableKey: 'المفتاح العام (Publishable Key)',
+    secretKey: 'المفتاح السري (Secret Key)',
+    webhookSecret: 'مفتاح الـ Webhook',
+    saveStripeConfig: 'حفظ إعدادات Stripe',
+    amount: 'المبلغ',
+    paymentMethod: 'طريقة الدفع',
+    requestDate: 'تاريخ الطلب',
+    actions: 'الإجراءات',
+    verified: 'موثق',
+    paypal: 'باي بال',
+    approve: 'موافقة',
+    reject: 'رفض',
+    requireKyc: 'طلب توثيق الهوية',
+    kycStatus: 'حالة التوثيق',
+    accountStatus: 'حالة الحساب',
+    identityVerification: 'توثيق الهوية',
+    required: 'مطلوب',
+    notRequired: 'غير مطلوب',
+    kycSelfieReview: 'مراجعة صورة التوثيق',
+    pendingReview: 'بانتظار المراجعة',
+    fullNameOnID: 'الاسم الكامل في الهوية:',
+    identitySection: 'قسم الهوية',
+    kycPending: 'قيد المراجعة',
+    kycVerified: 'تم التحقق بنجاح',
+    kycRejected: 'تم الرفض',
+    kycRejectionReason: 'سبب الرفض',
+    kycNone: 'لم يبدأ',
+    kycStatusLabel: 'حالة توثيق الحساب',
+    accountSettings: 'إعدادات الحساب',
+    shortcuts: 'الاختصارات',
+    wallet: 'المحفظة',
+    memoryCenter: 'ذاكرة المساعد',
+    all: 'الكل',
+    personal: 'شخصي',
+    technical: 'تقني',
+    preference: 'تفضيلات',
+    project: 'مشروع',
+    identity: 'هوية',
+    professional: 'مهني',
+    general: 'عام',
+    addFact: 'إضافة حقيقة',
+    memoryCapacity: 'سعة الذاكرة',
+    prune: 'تنظيف',
+    loadingMemory: 'جاري تحميل الذاكرة...',
+    noResults: 'لا توجد نتائج',
+    memoryLimitReached: 'لقد وصلت إلى الحد الأقصى للذاكرة (50). يرجى حذف بعض الحقائق القديمة أولاً.',
+    systemSettings: 'إعدادات النظام',
+    smartEmailHub: 'البريد الذكي',
+    toolOrchestrator: 'الأوركسترا',
+    paymentGateways: 'بوابات الدفع',
+    withdrawals: 'طلبات السحب',
+    kycRequests: 'طلبات التوثيق',
+    ledger: 'سجل العمليات',
+    modelProviders: 'مزودي النماذج',
+    users: 'المستخدمين',
+    plans: 'الخطط والاستهلاك',
+    saveSuccess: 'تم الحفظ بنجاح',
+    saveFailed: 'فشل الحفظ',
+    add: 'إضافة',
+    edit: 'تعديل',
+    delete: 'حذف',
+    appName: 'بيربليكستا',
+    home: 'الرئيسية',
+    save: 'حفظ',
+    avatar: 'الصورة الشخصية',
+    uploadFile: 'رفع ملف',
+    videoDuration: 'المدة',
+    cinematic: 'سينمائي',
+    realistic: 'واقعي',
+    anime: 'أنمي',
+    'digital art': 'فن رقمي',
+    standard: 'عادي',
+    hd: 'عالي الجودة',
+    ultra: 'فائق الجودة',
+
+    testConnection: 'فحص الاتصال',
+    email: 'البريد الإلكتروني',
+    password: 'كلمة المرور',
+    confirmPassword: 'تأكيد كلمة المرور',
+    processing: 'جاري المعالجة',
+    continueWithGoogle: 'المتابعة باستخدام قوقل',
+    noAccount: 'ليس لديك حساب؟',
+    haveAccount: 'لديك حساب بالفعل؟',
+    createAccount: 'إنشاء حساب جديد',
+    signup: 'إنشاء حساب',
+    welcome: 'مرحباً بعودتك!',
+    logout: 'تسجيل الخروج',
+    forgotPassword: 'نسيت كلمة المرور؟',
+    forgotPasswordTitle: 'استعادة كلمة المرور',
+    forgotPasswordDesc: 'أدخل بريدك الإلكتروني لاستعادة كلمة المرور',
+    sendResetLink: 'إرسال الرابط',
+    rememberedPassword: 'تذكرت كلمة المرور؟',
+    login: 'تسجيل الدخول',
+    analyzingResources: 'جاري تحليل الموارد...',
+    usageToday: 'الاستهلاك اليومي',
+    usageMonthly: 'الاستهلاك الشهري',
+    resourceId: 'المعرف',
+    renewal: 'التجديد',
+    quotaInfoTitle: 'إدارة الحصص الاحترافية',
+    quotaInfoDesc: 'يتم تصفير العدادات اليومية كل 24 ساعة، بينما يتم تصفير العدادات الشهرية في بداية كل شهر ميلادي. في حال تخطي الحصة المجانية، سيقوم النظام تلقائياً بالخصم من رصيد المحفظة لضمان استمرارية الخدمة بأقل تكلفة.',
+
+    addNewPlan: 'خطة جديدة',
+    planNameEn: 'اسم الخطة بالإنجليزية',
+    planNameAr: 'اسم الخطة بالعربية',
+    planDescEn: 'وصف الخطة بالإنجليزية',
+    planDescAr: 'وصف الخطة بالعربية',
+    planFeaturesEn: 'الميزات بالإنجليزية',
+    planFeaturesAr: 'الميزات بالعربية',
+    addFeature: 'إضافة ميزة',
+    badge: 'الشارة',
+    discountPercentage: 'نسبة الخصم',
+    visible: 'مرئي',
+    limits: 'الحدود',
+    images: 'الصور',
+    connectors: 'الموصلات',
+    workspace: 'استوديو الصوت الذكي',
+    search: 'البحث',
+    art: 'الفن',
+    none: 'لا يوجد',
+    bestSeller: 'الأكثر مبيعاً',
+    popular: 'شائع',
+    unlimited: 'unlimited',
+    payWithBalance: 'الدفع بالرصيد',
+    payWithPoints: 'الدفع بالنقاط',
+    upgrade: 'ترقية',
+    daily: 'يومي',
+    monthly: 'شهري',
+    annual: 'سنوي',
+    confirmSubscription: 'تأكيد الاشتراك',
+    confirmSubscriptionDesc: 'أنت على وشك الاشتراك في خطة {plan} باستخدام رصيدك الحالي.',
+    currentBalance: 'رصيدك الحالي',
+    planPrice: 'قيمة الخطة',
+    remainingBalance: 'الرصيد المتبقي بعد الدفع',
+    confirmAndActivate: 'تأكيد وتفعيل الاشتراك',
+    cancel: 'إلغاء',
+    insufficientBalance: 'رصيدك غير كافٍ لإتمام هذه العملية.',
+    subscriptionSuccess: 'تم الاشتراك بنجاح!',
+    quotaMilestoneTitle: 'استهلاك {percentage}%',
+    quotaMilestone50: 'لقد استهلكت نصف الحد المسموح لك للهذه الأداة!',
+    quotaMilestone90: 'تنبيه: أنت على وشك استهلاك كامل الحد المسموح!',
+    quotaMilestone100: 'انتهى الحد المسموح! الخدمة مستمرة بالخصم من الرصيد.',
+    quotaMilestoneIncentive: 'ادعُ أصدقاءك للحصول على نقاط إضافية والاستمرار في الخدمة باحترافية.',
+    rewardFriends: 'اربح مع أصدقائك',
+    subscriptionSuccessDesc: 'تم تفعيل خطتك بنجاح! اكسب المزيد من النقاط بدعوة أصدقائك.',
+    insufficientBalanceTitle: 'رصيد غير كافٍ',
+    insufficientBalanceDesc: 'ليس لديك رصيد كافٍ للاشتراك. ادعُ أصدقاءك لكسب النقاط والاستمرار في استخدام خدماتنا.',
+    shareWithFriends: 'شارك مع أصدقائك',
+    close: 'إغلاق',
+    planForCreators: 'للمؤثرين',
+    planForPros: 'للمستخدمين المتقدمين',
+    planForBusiness: 'للشركات',
+    planColor: 'لون الخطة',
+
+    consumptionRadar: 'رادار الاستهلاك',
+    realTimeSync: 'مزامنة لحظية للموارد',
+    liveNow: 'نشط الآن',
+    currentPlan: 'الخطة الحالية',
+    subscriptionCycle: 'دورة الاشتراك',
+    daysRemaining: 'باقي {days} يوم',
+    limitless: 'غير محدود',
+    of: 'من',
+    usageLoad: 'نسبة الاستخدام',
+    noActiveRadar: 'لا يوجد رادار نشط',
+    noActiveRadarDesc: 'اشترك في إحدى باقاتنا لتفعيل رادار الاستهلاك والمزامنة الحية.',
+    resourceResetProtocol: 'بروتوكول تصفير الموارد',
+    resourceResetDesc: 'تتم إعادة تعيين عدادات استهلاك الموارد الملحقة آلياً عند الساعة 12:00 منتصف الليل (UTC).',
+    searchUsers: 'البحث عن مستخدم (الاسم، البريد)...',
+    active: 'مفعل',
+    suspended: 'موقوف',
+    sendEmail: 'إرسال بريد',
+    viewProfile: 'عرض الملف',
+    userProfile: 'ملف المستخدم',
+    plan: 'الباقة',
+    changePlan: 'تغيير الباقة',
+    adjustBalance: 'تعديل الرصيد',
+    accountActions: 'إجراءات الحساب',
+    suspendAccount: 'إيقاف الحساب',
+    activateAccount: 'تنشيط الحساب',
+    joinedAt: 'تاريخ الانضمام',
+    lastLogin: 'آخر تسجيل دخول',
+    usageStats: 'إحصائيات الاستخدام',
+    quickActions: 'إجراءات سريعة',
+    emailSubject: 'موضوع الرسالة',
+    emailBody: 'نص الرسالة',
+    send: 'إرسال',
+    saveChanges: 'حفظ التغييرات',
+    emailSettings: 'إعدادات البريد',
+    emailTemplates: 'قوالب البريد',
+    broadcast: 'حملات بريدية',
+    smtpSettings: 'إعدادات مزود الإرسال',
+    smtpHost: 'الخادم',
+    smtpPort: 'المنفذ',
+    smtpUsername: 'اسم المستخدم',
+    smtpPassword: 'كلمة المرور',
+    senderName: 'اسم المرسل',
+    senderEmail: 'بريد المرسل',
+    smtpTestConnection: 'اختبار الاتصال',
+    createNewTemplate: 'إنشاء قالب جديد',
+    templateName: 'اسم القالب',
+    variables: 'المتغيرات المتاحة',
+    editTemplate: 'تعديل القالب',
+    systemTemplates: 'قوالب النظام الأساسية',
+    customTemplates: 'قوالب مخصصة',
+    welcomeEmail: 'رسالة الترحيب',
+    resetPasswordEmail: 'استعادة كلمة المرور',
+    subscriptionSuccessEmail: 'نجاح الاشتراك',
+    sendTestEmail: 'إرسال رسالة تجريبية',
+    mailerType: 'نوع الإرسال',
+    phpMail: 'دالة PHP Mail',
+    smtp: 'خادم SMTP',
+    encryption: 'نوع التشفير',
+    noneEncryption: 'بدون تشفير',
+    ssl: 'SSL',
+    tls: 'TLS',
+    smtpDesc: 'قم بإعداد مزود البريد الإلكتروني الخاص بك',
+    securityProtocol: 'بروتوكول الأمان',
+    securityProtocolDesc: 'يتم تشفير بيانات اعتماد البريد الإلكتروني باستخدام AES-256 قبل تخزينها في ملف التكوين الآمن. لا يتم كشفها للواجهة الأمامية أو تخزينها كنص صريح في قاعدة البيانات أبداً.',
+    spamWarning: 'تأكد من أن مزود الخدمة الخاص بك يسمح بالإرسال من "بريد المرسل" المحدد لتجنب وصول رسائلك إلى مجلد البريد المزعج (Spam).',
+    clickToCopy: 'انقر للنسخ واللصق في قالبك.',
+    broadcastTitle: 'حملات البث المباشر',
+    broadcastDesc: 'أرسل رسائل بريد إلكتروني جماعية لشرائح محددة من المستخدمين، أعلن عن ميزات جديدة، أو قم بتشغيل حملات ترويجية مباشرة من هنا.',
+    createCampaign: 'إنشاء حملة',
+    campaignName: 'اسم الحملة',
+    selectTemplate: 'اختر القالب',
+    targetAudience: 'الجمهور المستهدف',
+    byPlan: 'حسب الباقة',
+    byActivity: 'حسب النشاط',
+    activeUsers: 'المستخدمون النشطون',
+    inactiveUsers: 'المستخدمون غير النشطين',
+    sendCampaign: 'إرسال الحملة',
+    campaignHistory: 'سجل الحملات',
+    broadcastHistory: 'سجل عمليات البث',
+    sent: 'تم الإرسال',
+    pendingBroadcast: 'قيد المتابعة',
+    failedBroadcast: 'فشل الإرسال',
+    recipients: 'المستلمون',
+    totalSent: 'إجمالي المرسل',
+    successRate: 'نسبة النجاح',
+    noCampaigns: 'لا توجد حملات مرسلة بعد.',
+    confirmSendCampaign: 'هل أنت متأكد من رغبتك في إرسال هذه الحملة الآن؟ قد يستغرق الأمر بعض الوقت اعتماداً على عدد المستحقين.',
+    campaignStartSuccess: 'بدأت الحملة بنجاح، يمكنك متابعة التقدم في السجل.',
+    campaignStartError: 'حدث خطأ أثناء بدء الحملة.',
+    smartBroadcast: 'مركز البث الذكي',
+    broadcastDescription: 'بث حملات البريد الإلكتروني والتنبيهات الفورية بفعالية واحترافية عالية.',
+    newBroadcast: 'بث جديد',
+    back: 'عودة للخلف',
+    broadcastType: 'وسيلة البث',
+    broadcastEmail: 'البريد الإلكتروني',
+    broadcastNotification: 'تنبيه النطاق الداخلي',
+    broadcastBoth: 'القنوات المدمجة (بريد وتنبيه)',
+    targetGroup: 'الشريحة المستهدفة',
+    allUsers: 'قاعدة المستخدمين الشاملة',
+    proOnly: 'مشتركي النخبة (PRO) فقط',
+    freeOnly: 'المستخدمين العاديين',
+    titleEn: 'العنوان بالإنجليزية',
+    titleAr: 'العنوان بالعربية',
+    contentEn: 'المحتوى بالإنجليزية',
+    contentAr: 'المحتوى بالعربية',
+    sendNow: 'إطلاق البث الآن',
+    loadingRecords: 'جاري استدعاء السجلات...',
+    noBroadcasts: 'لم يتم رصد أي عمليات بث سابقة.',
+    launchFirstBroadcast: 'ابدأ حملتك الأولى الآن!',
+    broadcastSuccess: 'تم إنجاز البث بنجاح إلى {count} مستخدم',
+    totalBroadcasts: 'إجمالي الحملات',
+    totalReached: 'إجمالي الوصول',
+    activeStatus: 'حالة المحرك',
+    engineStatus: 'جاهزية التشغيل',
+    ready: 'جاهز (READY)',
+    sentCount: 'مستلم',
+    lastActive: 'آخر نشاط',
+    loginInLast: 'سجل الدخول في آخر',
+    days: 'أيام',
+    notLoginInLast: 'لم يسجل الدخول في آخر',
+    any: 'أي',
+    activeSubscription: 'اشتراك نشط',
+    suspendedSubscription: 'حساب موقوف',
+    verifiedKYC: 'حساب موثق (KYC)',
+    notVerifiedKYC: 'حساب غير موثق',
+    role_admin: 'مدير نظام',
+    role_support: 'دعم فني',
+    role_elite: 'مستخدم إيليت',
+    role_user: 'مستخدم',
+    userManagement: 'إدارة المستخدمين',
+    addExplorer: 'إضافة مستخدم',
+    deleteUser: 'حذف مستخدم',
+    ai: 'الذكاء الاصطناعي',
+    system: 'النظام',
+    walletAlerts: 'تنبيهات المحفظة',
+    discrepancyAnalysis: 'تحليل التناقضات',
+    registryVelocityIndex: 'مؤشر سرعة السجل',
+    secure: 'آمن',
+    warning: 'تحذير',
+    critical: 'حرج',
+    withdrawal: 'طلب سحب',
+    kyc: 'طلب توثيق',
+    highValue: 'قيمة عالية',
+    todayTx: 'حركات اليوم',
+    alertLevel: 'مستوى التنبيه',
+    showingLast100: 'عرض آخر 100 سجل',
+    deleteAlert: 'هل أنت متأكد من حذف هذا التنبيه؟',
+    justNow: 'الآن',
+    minutesAgo: 'منذ {n} د',
+    hoursAgo: 'منذ {n} س',
+    visualIdentity: 'الهوية البصرية',
+    siteSettings: 'إعدادات الموقع',
+    siteName: 'اسم الموقع',
+    siteDescription: 'وصف الموقع',
+    logo: 'اللوغو (الشعار)',
+    siteFavicon: 'أيقونة الموقع',
+    seoFields: 'حقول تحسين محركات البحث',
+    metaTags: 'الكلمات الدلالية',
+    uploadLogo: 'رفع اللوغو',
+    uploadFavicon: 'رفع الأيقونة',
+    saveSystemSettings: 'حفظ الإعدادات',
+    generalSettings: 'الإعدادات العامة',
+    seoDescriptionAr: 'وصف محركات البحث',
+    seoDescriptionEn: 'وصف محركات البحث (إنجليزية)',
+    keywordsAr: 'الكلمات المفتاحية (مفصولة بفاصلة)',
+    keywordsEn: 'الكلمات المفتاحية (بالإنجليزية، مفصولة بفاصلة)',
+    googleAnalyticsId: 'معرف إحصاءات جوجل',
+    googleAnalyticsDesc: 'مثال: G-XXXXXXXXXX',
+    googleSiteVerification: 'كود التحقق من Google Search Console',
+    googleSiteVerificationDesc: 'أدخل رمز التحقق (مثال: google-site-verification=...) لإثبات ملكية موقعك تلقائياً.',
+    seoPreviewImageTitle: 'صورة معاينة محركات البحث ومواقع التواصل (SEO Share Image / og:image)',
+    seoDragAndDrop: 'اسحب الملف إلى هنا أو اضغط للتصفح',
+    seoSupportedFormats: 'التنسيقات المدعومة: PNG, JPG, WEBP',
+    seoBestPracticesTitle: 'متطلبات تحسين محركات البحث وسلاسل القيمة الفنية لقوقل وميتا:',
+    seoBestPracticesRecSize: 'الأبعاد الموصى بها:',
+    seoBestPracticesRecSizeDesc: '1200 × 630 بكسل لبث دقة فائقة',
+    seoBestPracticesRatio: 'نسبة العرض إلى الارتفاع:',
+    seoBestPracticesRatioDesc: '1.91:1 (لتسهيل القراءة وتفادي القص)',
+    seoBestPracticesFileSize: 'الحجم الأقصى الفعال:',
+    seoBestPracticesFileSizeDesc: '2MB (لتحسين سرعة المحتوى ومؤشرات حيوية الويب)',
+    seoSocialPreviewTitle: 'مخطط معاينة بطاقة شبكات التواصل (Open Graph / Rich Link Preview):',
+    seoNoImageYet: 'لم يتم رفع صورة بعد',
+    seoPreviewFooterNote: '* يظهر هذا المخطط الهيكلي التفاعلي جودة وعرض الصورة مع الوصف عند مشاركة رابط المنصة عبر منصات التواصل مثل فيسبوك، واتساب، لينكدإن وتويتر.',
+    seoRemoveImage: 'حذف الصورة',
+    monthlyRevenue: 'الإيرادات الشهرية',
+    activeUsersToday: 'المستخدمون النشطون (اليوم)',
+    aiGenerations: 'عمليات التوليد الرقمية',
+    systemHealth: 'جاهزية النظام',
+    optimal: 'مثالية',
+    activityCleared: 'تم تطهير السجلات بنجاح',
+    alertsCleared: 'تم مسح التنبيهات الأمنية',
+    selectAll: 'تحديد الكل',
+    batchDeleteConfirm: 'هل أنت متأكد من حذف {count} من العناصر المحددة؟',
+    batchDeleteSuccess: 'تم حذف {count} من العناصر بنجاح.',
+    deleteSelected: 'حذف المحدد',
+    systemMaintenance: 'صيانة النظام',
+    pruneSuccess: 'تم تنظيف الإشعارات القديمة بنجاح',
+    clearAllChats: 'تطهير الذاكرة السحابية (المحادثات)',
+    clearAllChatsConfirm: 'تحذير: هذا سيؤدي إلى حذف كافة المحادثات والرسائل من قاعدة البيانات. هل أنت متأكد؟',
+    bulkDeleteActivityConfirm: 'هل أنت متأكد من حذف كافة سجلات {type}؟ لا يمكن التراجع عن هذه الخطوة.',
+    bulkDeleteAlertsConfirm: 'هل أنت متأكد من مسح كافة الإنذارات الأمنية؟ سيتم مسح تاريخ المراقبة بالكامل.',
+    maintenancePruneLegacy: 'مهمة الصيانة: مسح الإشعارات القديمة',
+    maintenanceClearAllNotifs: 'مهمة الصيانة: مسح كافة الإشعارات',
+    clearNotifsConfirm: 'هل أنت متأكد من حذف كافة إشعارات النظام لجميع المستخدمين بشكل نهائي؟',
+    cpuLoad: 'ضغط المعالج (CPU)',
+    memoryAllocation: 'تخصيص الذاكرة',
+    systemLoad: 'حمل النظام',
+    engineHealth: 'كفاءة المحرك والبنية التحتية',
+    databases: 'قواعد البيانات المتعددة',
+    coreDb: 'قاعدة البيانات الأساسية',
+    ledgerDb: 'قاعدة البيانات المالية',
+    connected: 'نشط ومتصل',
+    aiQuotas: 'حصص استهلاك الذكاء الاصطناعي',
+    financialRadar: 'الرادار المالي الرقمي',
+    viewAllTx: 'استعراض كافة المعاملات',
+    activityStream: 'سجل الأنشطة المباشرة',
+    securityAlerts: 'المراقبة والإنذارات الأمنية',
+    systemUptime: 'وقت تشغيل النظام',
+    stableOperationalProtocol: 'بروتوكول تشغيل مستقر',
+    financialRadarSubtitle: 'بروتوكول مراقبة الاقتصاد المباشر وتدقيق السجلات',
+    searchTxPlaceholder: 'بحث في الحركات...',
+    searchActivityPlaceholder: 'بحث في سجل العمليات والأنشطة...',
+    walletAlertsEmpty: 'لا توجد تنبيهات حرجة للمحفظة.',
+    ledgerExpectation: 'توقعات السجل',
+    noDiscrepancies: 'لم يتم الكشف عن أي تناقضات مالية.',
+    liveLedgerAudit: 'تدقيق السجل المباشر',
+    amountPointsLabel: 'المبلغ (نقطة)',
+    typeActionLabel: 'النوع / الإجراء',
+    quickVelocity: 'الإحصائيات السريعة',
+    allBalancesSynced: 'كافة الأرصدة متوافق مع السجل.',
+    noFinancialVectors: 'لا توجد حركات مالية مطابقة للفلاتر.',
+    liveTransactionRegistry: 'سجل العمليات المباشر',
+    entityUser: 'المستخدم',
+    protocol: 'العملية',
+    vector: 'المقدار',
+    timestamp: 'الوقت',
+    apiVaultTitle: 'خزنة مفاتيح الواجهات البرمجية',
+    apiVaultDesc: 'إدارة وتشفير مفاتيح الوصول لخدمات الذكاء الاصطناعي. نعتمد معيار التشفير AES-256 لحماية البيانات وضمان زمن استجابة فائق في التنفيذ.',
+    apiVaultProvider: 'المزود العالمي',
+    apiKey: 'مفتاح الوصول (API Key)',
+    apiVaultTestConnection: 'اختبار الاتصال',
+    saveKey: 'تشفير وحفظ القفل',
+    keyEncrypted: 'محمي بنظام التشفير القياسي AES-256',
+    statusActive: 'نشط وفعال',
+    statusMissing: 'مفقود',
+    showKey: 'إظهار الهوية',
+    hideKey: 'إخفاء الهوية',
+    testing: 'جاري فحص النزاهة...',
+    needsVerification: 'يتطلب تفعيل',
+    currentUsage: 'مستوى الاستهلاك',
+    remaining: 'المتبقي المتاح',
+    used: 'المستنفذ',
+    dailyBudgetPlaceholder: 'الميزانية اليومية ($)',
+    budgetUpdateSuccess: 'تم تحديث سقف الميزانية بنجاح',
+    budgetUpdateFailed: 'فشل في تحديث سقف الميزانية',
+    connectionError: 'خطأ في بروتوكول الاتصال',
+    budget: 'الميزانية التشغيلية',
+    apiKeyLabel: 'الرمز السري (API)',
+    primaryEngine: 'المحرك الأساسي',
+    fallbackProtocol: 'بروتوكول الطوارئ',
+    costPoints: 'التكلفة (نقاط)',
+    utilizationRate: 'معدل الاستهلاك',
+    enterKeyPlaceholder: 'أدخل رمز الوصول هنا...',
+    syncModels: 'مزامنة أحدث النماذج',
+    saveKeyBtn: 'اعتماد المفتاح',
+    syncUsageLimits: 'مزامنة حدود الحصص',
+    ollamaUrlLabel: 'رابط الاتصال السحابي (Endpoint URL)',
+    ollamaCloudHint: 'ملاحظة: أدخل رابط Ollama Cloud الخاص بك هنا. يتم استخدام Localhost كخيار احتياطي فقط.',
+    dbOrchestrationTitle: 'قواعد البيانات',
+    dbOrchestrationDesc: 'إدارة التوازن والربط بين قواعد البيانات الأساسية والمالية بنظام التشفير المحلي الشامل.',
+    coreDbTitle: 'قاعدة البيانات الأساسية',
+    externalDbTitle: 'قاعدة الأقسام الخارجية',
+    securityDbTitle: 'قاعدة الحماية ومكافحة الإغراق',
+    coreDbLocalTitle: 'قاعدة الأساسية (محلية)',
+    ledgerDbLocalTitle: 'قاعدة المالية (محلية)',
+    coreDbCloudTitle: 'قاعدة الأساسية (سحابية)',
+    ledgerDbCloudTitle: 'قاعدة المالية (سحابية)',
+    coreDbDesc: 'البيانات التشغيلية',
+    ledgerDbDesc: 'البيانات المالية',
+    externalDbDesc: 'البيانات التكاملية والخدمات الخارجية المعزولة',
+    securityDbDesc: 'التحكم ومكافحة الإغراق وحماية الموارد',
+    dbHost: 'المضيف',
+    dbPort: 'المنفذ',
+    dbUsername: 'اسم المستخدم',
+    dbPassword: 'كلمة المرور',
+    dbName: 'اسم قاعدة البيانات',
+    connectionStringPlaceholder: 'postgresql://user:pass@host:port/db',
+    sslMode: 'تشفير الاتصال',
+    sslRequire: 'مطلوب',
+    sslDisable: 'معطل',
+    poolSize: 'حجم التجمع',
+    testDbConnection: 'فحص الاتصال',
+    saveDbConfig: 'حفظ الإعدادات',
+    migrateScratch: 'إنشاء المخطط من الصفر',
+    migrateAdditive: 'تحديث المخططات (مزامنة الهيكل)',
+    migrateScratchDesc: 'إجراء مسح شامل وإعادة بناء الجداول والهيكل التنظيمي من جديد (يتم حذف البيانات).',
+    migrateAdditiveDesc: 'مزامنة هيكل البيانات وإضافة التعديلات البرمجية دون المساس بالبيانات الحالية.',
+    statusConnected: 'متصل',
+    statusDisconnected: 'غير متصل',
+    cloud: 'سحابي',
+    local: 'محلي',
+    cloudModeHint: 'في الوضع السحابي، يتم الاعتماد كلياً على رابط الاتصال الكامل (Connection String).',
+    activate: 'تفعيل (Active)',
+    deactivate: 'إيقاف التفعيل',
+    standby: 'Standby',
+    cloudAutoScalingEnabled: 'التوسع التلقائي للسحابة مفعل',
+    connectionString: 'رابط الاتصال (PRIMARY)',
+    connectionUrl: 'رابط الاتصال الكامل',
+    dbTestSuccess: 'تم الاتصال بنجاح!',
+    dbTestFailed: 'فشل الاتصال: يرجى التحقق من البيانات.',
+    dbTestError: 'خطأ تقني أثناء محاولة الاتصال.',
+    dbSaveSuccess: 'تم حفظ إعدادات قاعدة البيانات بنجاح.',
+    dbSaveFailed: 'فشل في حفظ الإعدادات.',
+    dbSaveError: 'خطأ في النظام أثناء الحفظ.',
+    dbMigrationSuccess: 'تم تحديث مخطط قاعدة البيانات بنجاح.',
+    dbMigrationFailed: 'فشل تنفيذ التحديثات (Migrations).',
+    dbMigrationError: 'خطأ أثناء تنفيذ التحديثات.',
+    primaryDbDesc: 'قاعدة البيانات الأساسية للعمليات الحية والإنتاج.',
+    shadowDbDesc: 'نسخة احتياطية متزامنة للحفاظ على البيانات في حالات الطوارئ.',
+    core_shadowDbTitle: 'النسخة الاحتياطية للأساسية',
+    ledger_shadowDbTitle: 'النسخة الاحتياطية للمالية',
+    ledgerDbTitle: 'قاعدة البيانات المالية',
+    toolOrchestratorTitle: 'توجيه الأدوات',
+    toolOrchestratorDesc: 'نظام التوجيه الذكي. حدد النموذج الأساسي والنماذج الاحتياطية لكل أداة لضمان استمرارية العمل بدون توقف.',
+    orchestratorProvider: 'مزود الخدمة',
+    model: 'النموذج',
+    fallbackSubtitle: 'المزودين الاحتياطيين (يعمل عند العطل أو استهلاك 99%)',
+    fallback1: 'احتياطي 1',
+    fallback2: 'احتياطي 2',
+    fallback3: 'احتياطي 3',
+    orchestratorSave: 'حفظ',
+    toolCode: 'كود',
+    toolCodeDesc: 'أداة كتابة ومراجعة الأكواد البرمجية',
+    withdrawableBalance: 'الرصيد القابل للسحب',
+    requestWithdrawal: 'طلب سحب الرصيد',
+    pointsBalance: 'رصيد النقاط',
+    convertPointsToBalance: 'تحويل النقاط إلى رصيد',
+    howSystemWorks: 'كيف يعمل النظام؟',
+    shareYourLink: 'شارك رابطك',
+    shareYourLinkDesc: 'أرسل الرابط لأصدقائك أو انشره على وسائل التواصل',
+    registration: 'التسجيل',
+    registrationDesc: 'عندما يسجل صديقك، يحصل على {welcomeBonus} نقطة ترحيبية',
+    activationAndProfit: 'التفعيل والربح',
+    activationAndProfitDesc: 'بمجرد تفعيل حساب صديقك، تحصل أنت على {referralBonus} نقطة',
+    inviteFriendsAndEarn: 'ادعُ الأصدقاء واربح',
+    inviteFriendsDesc: 'احصل على {referralBonus} نقطة لكل صديق يسجل من خلالك. سيحصلون هم أيضاً على {welcomeBonus} نقطة!',
+    yourReferralLink: 'رابط الإحالة الخاص بك',
+    copy: 'نسخ',
+    copied: 'تم النسخ',
+    totalSuccessfulReferralsUser: 'إجمالي الإحالات الناجحة',
+    transactionHistory: 'سجل العمليات',
+    noTransactionsYet: 'لا توجد عمليات بعد. ابدأ بدعوة الأصدقاء لكسب النقاط!',
+    transactionsWillAppearHere: 'ستظهر معاملاتك هنا بمجرد البدء في استخدام النقاط.',
+    userName: 'اسم المستخدم',
+    userEmail: 'البريد الإلكتروني',
+    status: 'الحالة',
+    date: 'التاريخ',
+    withdrawalHistory: 'سجلات سحب الرصيد',
+    pointsConversionHistory: 'سجل تحويل النقاط إلى رصيد',
+    pendingHistory: 'قيد المعالجة',
+    completed: 'مكتملة',
+    failedStatus: 'فشلت',
+    convertPoints: 'تحويل النقاط',
+    numberOfPoints: 'عدد النقاط',
+    currentBalancePoints: 'رصيدك الحالي: {points} نقطة',
+    confirmConversion: 'تأكيد التحويل',
+    withdrawBalance: 'سحب الرصيد',
+    withdrawalAmount: 'المبلغ المراد سحبه',
+    minWithdrawalAmount: 'الحد الأدنى للسحب: {min}',
+    withdrawalMethod: 'طريقة السحب',
+    paypalUser: 'باي بال',
+    crypto: 'عملات رقمية',
+    bankAccount: 'حساب بنكي',
+    paymentDetails: 'بيانات الدفع',
+    paypalEmailPlaceholder: 'أدخل بريد باي بال...',
+    cryptoAddressPlaceholder: 'أدخل عنوان المحفظة...',
+    bankDetailsPlaceholder: 'أدخل رقم الحساب...',
+    sendRequest: 'إرسال الطلب',
+    kycVerification: 'توثيق الهوية',
+    kycThresholdNote: 'مطلوب فقط للسحوبات التي تتجاوز 100$',
+    kycDescription: 'لحماية مجتمعنا ومنع الاحتيال المالي، نلتزم بأعلى معايير الأمان والامتثال للقوانين الدولية. يرجى توثيق هويتك لتتمكن من سحب أرباحك بأمان.',
+    fullNameAsPerIdUser: 'الاسم الكامل (مطابق للهوية)',
+    takeSelfieWithId: 'التقاط سيلفي مع الهوية',
+    selfieSecurityNote: 'نطلب التقاط صورة حية (سيلفي) بدلاً من رفع ملفات لضمان أقصى درجات الأمان وحماية النظام من الملفات الضارة. التزاماً بقوانين حماية البيانات في المملكة المتحدة (UK GDPR)، نؤكد أنه لا يتم تخزين أي صور على خوادمنا؛ حيث يتم إرسالها مباشرة للإدارة ثم تُحذف فوراً من الذاكرة.',
+    submitKyc: 'إرسال طلب التوثيق',
+    selfieCaptured: 'تم التقاط الصورة بنجاح',
+    capture: 'التقاط الصورة',
+
+    userSettings: 'إعدادات الحساب',
+    profile: 'الملف الشخصي',
+    aiPreferences: 'تفضيلات الذكاء الاصطناعي',
+    appPreferences: 'تفضيلات التطبيق',
+    preferences: 'التفضيلات',
+    intelligenceCalibration: 'معايرة الذكاء',
+    languagePreference: 'تفضيلات اللغة',
+    themePreference: 'تفضيلات المظهر',
+    professionalIdentity: 'الوصف المهني',
+    eliteResponseStyles: 'أساليب ردود النخبة',
+    activeNow: 'نشط الآن',
+    updateProfile: 'تحديث الملف الشخصي',
+    customInstructions: 'نبذة عني',
+    customInstructionsDesc: 'أخبر المساعد عنك وعن تفضيلاتك.',
+    memoryLog: 'سجل الذاكرة',
+    memoryLogDesc: 'هذا هو ما تعلمه المساعد عنك وعن طريقة عملك. يمكنك تعديله أو مسحه في أي وقت.',
+    memoryLogPlaceholder: 'لا توجد ذاكرة مسجلة بعد...',
+    memoryAutoUpdateNote: 'ملاحظة: يقوم المساعد بتحديث هذا السجل تلقائياً بناءً على محادثاتك لضمان استمرارية السياق.',
+    clearMemory: 'مسح الذاكرة',
+    customInstructionsPlaceholder: 'مثال: أنا مطور واجهات أمامية (React). يرجى تقديم الأكواد مباشرة بدون شروحات مطولة إلا إذا طلبت ذلك.',
+    theme: 'المظهر',
+    language: 'اللغة',
+    lightMode: 'فاتح',
+    darkMode: 'داكن',
+    systemMode: 'تلقائي',
+    arabic: 'العربية',
+    english: 'English',
+    termsOfUse: 'شروط الخدمة',
+    privacyPolicy: 'سياسة الخصوصية',
+    cookiesPolicy: 'سياسة الكوكيز',
+    log_user_login: 'قام بتسجيل الدخول',
+    log_user_registration: 'انضم كمستخدم جديد',
+    log_notifications_prune: 'تطهير الإشعارات القديمة',
+    log_wallet_reconciliation: 'معايرة المحفظة يدوياً',
+    log_subscription_payment: 'تفعيل اشتراك مدفوع',
+    log_user_permissions_update: 'تحديث صلاحيات الحساب',
+    log_ai_generation: 'توليد ذكاء اصطناعي',
+    log_used_tool: 'استخدم أداة: {tool}',
+    log_notifications_prune_detail: 'تطهير يدوي للإشعارات القديمة',
+    log_login_detail: 'دخول ناجح للنظام',
+    log_registration_detail: 'تسجيل عضوية جديدة',
+    clearAILogs: 'مسح سجل الـ AI',
+    clearSystemLogs: 'مسح سجل النظام',
+    clearAll: 'مسح الكل',
+    noSecurityAlerts: 'لا توجد تنبيهات أمنية حالياً.',
+    noActivityLogged: 'لا يوجد نشاط مسجل حالياً.',
+    systemUser: 'النظام',
+    alert_usage_anomaly: 'خرق أمني: نشاط غير طبيعي',
+    alert_quota_bypass: 'خرق أمني: تجاوز القيود',
+    alert_ledger_discrepancy: 'تنبيه مالي: خطأ في السجل',
+    alert_unauthorized_access: 'دخول غير مصرح به',
+    alert_failed_login: 'فشل تسجيل دخول متكرر',
+    toastKeySaveSuccess: 'تم الحفظ',
+    toastKeySaveError: 'فشل الحفظ: {error}',
+    toastKeyDeleteSuccess: 'تم الحذف',
+    toastKeyDeleteError: 'فشل الحذف',
+    keyDeleteConfirm: 'هل أنت متأكد من حذف مفتاح {provider}؟ سيؤدي هذا إلى إيقاف الأدوات المرتبطة به.',
+    toastDbTestSuccess: 'تم الاتصال بنجاح',
+    toastDbTestFailed: 'فشل الاتصال: {error}',
+    toastDbSaveSuccess: 'تم الحفظ',
+    toastPlanSaveSuccess: 'تم الحفظ',
+    toastEconomySaveSuccess: 'تم الحفظ',
+    toastStripeSaveSuccess: 'تم الحفظ',
+    toastAllFieldsRequired: 'جميع حقول الترجمة مطلوبة (الأسماء والأوصاف)',
+    toastPricingRequired: 'حقول التسعير مطلوبة',
+    toastFeatureRequired: 'مطلوب ميزة واحدة على الأقل',
+    toastFeatureTranslationRequired: 'يجب أن تحتوي جميع الميزات على نص باللغتين الإنجليزية والعربية',
+    deletePlanConfirm: 'هل أنت متأكد من حذف هذه الخطة؟',
+    toastPlanDeleteSuccess: 'تم حذف الخطة بنجاح',
+    toastPlanDeleteError: 'فشل في حذف الخطة',
+    loadingCommandCenter: 'جاري جلب بيانات مركز القيادة...',
+    resourceUtilization: 'استهلاك الموارد',
+    serverMonitoringActive: 'يتم مراقبة الخادم بشكل لحظي.',
+    deleteLogConfirm: 'هل أنت متأكد من حذف هذا السجل؟',
+    deleteAlertConfirm: 'هل أنت متأكد من حذف هذا التنبيه؟',
+    reconcileConfirm: 'بدء عملية مطابقة المحفظة؟ سيتم إعادة معايرة رصيد المستخدم بناءً على المعاملات المسجلة فقط.',
+    reconcileSuccess: 'تمت المطابقة بنجاح. تم تحديث الرصيد.',
+    syncSuccess: 'تمت المزامنة بنجاح',
+    syncError: 'فشل المزامنة',
+    syncingData: 'جاري مزامنة البيانات...',
+    syncModelsFound: 'تم العثور على {count} نموذج للمزود {provider}',
+    syncUsageStats: 'الاستهلاك: ${used} من ميزانية ${total}',
+    saveData: 'حفظ البيانات',
+    lastSync: 'آخر مزامنة',
+    remember_me: 'تذكرني',
+    mood_epic: 'ملحمي',
+    mood_dramatic: 'درامي',
+    mood_corporate: 'مؤسسي',
+    mood_chill: 'هادئ',
+    mood_energetic: 'حماسي',
+    mood_romantic: 'رومانسي',
+    vocal_none: 'بدون',
+    vocal_male: 'ذكر',
+    vocal_female: 'أنثى',
+    vocal_robot: 'روبوت',
+    vocal_professional: 'احترافي',
+    mood: 'الحالة',
+    vocalType: 'نوع الصوت',
+    audioDuration: 'المدة',
+    howCanIHelp: 'كيف يمكنني مساعدتك اليوم؟',
+    navVisualIdentity: 'الهوية البصرية',
+    saveNewPlan: 'حفظ الخطة الجديدة',
+    favicon: 'أيقونة Favicon',
+    pendingBroadcastHistory: 'سجل البث المعلق',
+    failedOrBlocked: 'فاشل أو محظور',
+    category: 'الفئة',
+    activePlan: 'الخطة النشطة',
+    noPlan: 'لا توجد خطة',
+    retry: 'إعادة المحاولة',
+    logDeleted: 'تم حذف السجل',
+    dbActivateSuccess: 'تم تفعيل قاعدة البيانات بنجاح',
+    dbDeactivateSuccess: 'تم إيقاف قاعدة البيانات بنجاح',
+    environment: 'البيئة',
+    allFieldsRequired: 'جميع الحقول مطلوبة',
+    discover: 'استكشف',
+    studio: 'الاستوديو',
+    subscriptions: 'الاشتراكات',
+    invalidRequest: 'طلب غير صالح',
+    backToHome: 'العودة للرئيسية',
+    type: 'النوع',
+    description: 'الوصف',
+    loadMore: 'تحميل المزيد',
+  },
+  en: {
+    rewards: 'Rewards',
+    subscription: 'Subscriptions',
+    consumption: 'Consumption',
+    inactivityWarningTitle: 'Session is About to Expire',
+    sessionExpiringTitle: 'Session Expiring Soon',
+    sessionExpiringMessage: 'Your session will expire in 5 minutes. Please refresh your page or re-login to stay connected.',
+    refreshNow: 'Refresh Now',
+    inactivityWarningDesc: 'We noticed you have been inactive. For your security, you will be automatically logged out in {seconds} seconds.',
+    stayLoggedInBtn: 'Stay Logged In',
+    logoutNowBtn: 'Logout Now',
+    usageRadar: 'Usage Radar',
+    realTimeUsageSync: 'Real-time resource synchronization',
+    dashboard: 'Dashboard',
+    newChat: 'New Chat',
+    settings: 'Settings',
+    howCanIHelp: 'How can I help?',
+    askAssistant: 'Ask or prompt...',
+    fast: 'Fast',
+    pro: 'Pro',
+    thinking: 'Think',
+    uploadImage: 'Upload Image',
+    uploadDocument: 'Upload Document',
+    chat: 'Chat',
+    chat_fast: 'Fast Chat',
+    chat_pro: 'Pro Chat',
+    chat_reasoning: 'Reasoning Mode',
+    sovereign_search: 'Research & Studies',
+    sovereign_search_desc: 'Comprehensive research synthesis, methodological deconstruction, and literature reviews.',
+    perplexta_analysis: 'Analysis & Forensics',
+    perplexta_analysis_desc: 'Document, File & Vision Forensic Analysis',
+    ads_copilot: 'Ads Copilot',
+    ads_copilot_desc: 'Strategic campaign design, ad copywriting, and growth optimization for ViralBook and global platforms.',
+    image: 'Image Generation',
+    video: 'Video Generation',
+    code: 'Code Studio (IDE)',
+    audio_studio: 'Audio Studio',
+    audio_studio_desc: 'State-of-the-art vocal synthesis, speech transcribing, and orchestral music composition.',
+    stt: 'Speech to Text (STT)',
+    tts: 'Text to Speech (TTS)',
+    perplexta_music: 'Music Composition',
+    perplexta_music_desc: 'Advanced acoustic composition and structural music synthesis.',
+    storage_mb: 'Storage Space (MB)',
+    x402_api: 'Agent Gateway (x402 API)',
+    x402_api_desc: 'Dynamic high-fidelity artificial intelligence analytics gateway for programmatic developer clients protected via x402 protocol.',
+    newBadge: 'NEW',
+    commandCenter: 'Command Center',
+    referralDashboard: 'Referral Dashboard',
+    aiInfrastructure: 'API Keys Vault',
+    dbOrchestration: 'Database Orchestration',
+    financeVault: 'Finance Ledger',
+    financeVaultDesc: 'Manage economic settings, payment gateways, and withdrawals.',
+    economySettings: 'Economy Settings',
+    saveSettings: 'Save Settings',
+    minWithdrawal: 'Min Withdrawal (Cents)',
+    minWithdrawalDesc: 'Minimum amount a user can request for withdrawal.',
+    referralBonus: 'Referral Bonus (Points)',
+    referralBonusDesc: 'Points awarded to the referrer.',
+    welcomeBonus: 'Welcome Bonus (Points)',
+    welcomeBonusDesc: 'Points awarded to new users.',
+    conversionRate: 'Conversion Rate',
+    conversionRateDesc: 'Value of one point in USD.',
+    pointsPerDollar: 'Points per Dollar',
+    pointsPerDollarDesc: 'Points awarded per dollar spent.',
+    points: 'Points',
+    point: 'Point',
+    cents: 'Cents',
+    stripeConfig: 'Stripe Configuration',
+    stripeDesc: 'Manage Stripe API keys for subscriptions and payments.',
+    testMode: 'Test Mode',
+    liveMode: 'Live Mode',
+    publishableKey: 'Publishable Key',
+    secretKey: 'Secret Key',
+    webhookSecret: 'Webhook Secret',
+    saveStripeConfig: 'Save Stripe Config',
+    amount: 'Amount',
+    paymentMethod: 'Payment Method',
+    requestDate: 'Request Date',
+    actions: 'Actions',
+    verified: 'Verified',
+    paypal: 'PayPal',
+    approve: 'Approve',
+    reject: 'Reject',
+    requireKyc: 'Require KYC',
+    kycStatus: 'KYC Status',
+    accountStatus: 'Account Status',
+    identityVerification: 'Identity Verification',
+    required: 'Required',
+    notRequired: 'Not Required',
+    kycSelfieReview: 'KYC Selfie Review',
+    pendingReview: 'Pending Review',
+    fullNameOnID: 'Full Name on ID:',
+    identitySection: 'Identity Section',
+    kycPending: 'Under Review',
+    kycVerified: 'Verified Successfully',
+    kycRejected: 'Rejected',
+    kycRejectionReason: 'Rejection Reason',
+    kycNone: 'None',
+    kycStatusLabel: 'Account Verification Status',
+    accountSettings: 'Account Settings',
+    saveSuccess: 'Saved successfully',
+    saveFailed: 'Failed to save',
+    wallet: 'Wallet',
+    memoryCenter: 'Memory Center',
+    all: 'All',
+    personal: 'Personal',
+    technical: 'Technical',
+    preference: 'Preference',
+    project: 'Project',
+    identity: 'Identity',
+    professional: 'Professional',
+    general: 'General',
+    addFact: 'Add Fact',
+    memoryCapacity: 'Memory Capacity',
+    prune: 'Prune',
+    loadingMemory: 'Loading memory...',
+    noResults: 'No Results',
+    memoryLimitReached: 'You have reached the memory limit (50). Please delete some old facts first.',
+    shortcuts: 'Shortcuts',
+    plansSubscriptions: 'Plans & Subscriptions',
+    systemSettings: 'System Settings',
+    smartEmailHub: 'Smart Email Hub',
+    toolOrchestrator: 'Tool Orchestrator',
+    paymentGateways: 'Payment Gateways',
+    withdrawals: 'Withdrawals',
+    kycRequests: 'KYC Requests',
+    ledger: 'Ledger',
+    role_admin: 'Admin',
+    role_support: 'Support',
+    role_elite: 'Elite User',
+    role_user: 'User',
+    userManagement: 'User Management',
+    addExplorer: 'Add User',
+    deleteUser: 'Delete User',
+    ai: 'AI',
+    system: 'System',
+    walletAlerts: 'Wallet Alerts',
+    discrepancyAnalysis: 'Discrepancy Analysis',
+    registryVelocityIndex: 'REGISTRY VELOCITY INDEX',
+    secure: 'SECURE',
+    warning: 'WARNING',
+    critical: 'CRITICAL',
+    withdrawal: 'Withdrawal',
+    kyc: 'KYC',
+    highValue: 'High Value',
+    todayTx: 'Today\'s Tx',
+    alertLevel: 'Alert Level',
+    showingLast100: 'showing last 100 entries',
+    deleteAlert: 'Are you sure you want to delete this alert?',
+    justNow: 'Just now',
+    minutesAgo: 'm ago {n}',
+    hoursAgo: 'h ago {n}',
+    navVisualIdentity: 'Visual Identity',
+    modelProviders: 'Model Providers',
+    users: 'Users',
+    plans: 'Plans & Usage',
+    add: 'Add',
+    edit: 'Edit',
+    delete: 'Delete',
+    appName: 'Perplexta',
+    home: 'Home',
+    save: 'Save',
+    avatar: 'Avatar',
+    uploadFile: 'Upload File',
+    videoDuration: 'Duration',
+    cinematic: 'Cinematic',
+    realistic: 'Realistic',
+    anime: 'Anime',
+    'digital art': 'Digital Art',
+    standard: 'Standard',
+    hd: 'HD',
+    ultra: 'Ultra',
+    login: 'Login',
+    signup: 'Sign Up',
+    email: 'Email',
+    password: 'Password',
+    confirmPassword: 'Confirm Password',
+    processing: 'Processing',
+    continueWithGoogle: 'Continue with Google',
+    noAccount: 'Don\'t have an account?',
+    haveAccount: 'Already have an account?',
+    createAccount: 'Create new account',
+    welcome: 'Welcome back!',
+    logout: 'Logout',
+    forgotPasswordTitle: 'Forgot Password',
+    forgotPasswordDesc: 'Enter your email to reset your password',
+    forgotPassword: 'Forgot Password?',
+    sendResetLink: 'Send Reset Link',
+    rememberedPassword: 'Remembered your password?',
+    financialRadar: 'Financial Radar',
+    analyzingResources: 'Analyzing Resources...',
+    usageToday: 'Daily usage',
+    usageMonthly: 'Monthly usage',
+    resourceId: 'ID',
+    renewal: 'Renewal',
+    quotaInfoTitle: 'Professional Quota Management',
+    quotaInfoDesc: 'Daily counters reset every 24 hours, while monthly counters reset at the beginning of each calendar month. If free quota is exceeded, the system automatically draws from your wallet balance to ensure service continuity.',
+    addNewPlan: 'New Plan',
+    planNameEn: 'Plan Name (English)',
+    planNameAr: 'Plan Name (Arabic)',
+    planDescEn: 'Plan Description (English)',
+    planDescAr: 'Plan Description (Arabic)',
+    planFeaturesEn: 'Features (English)',
+    planFeaturesAr: 'Features (Arabic)',
+    addFeature: 'Add Feature',
+    badge: 'Badge',
+    discountPercentage: 'Discount %',
+    visible: 'Visible',
+    limits: 'Limits',
+    images: 'Images',
+    connectors: 'Connectors',
+    workspace: 'Smart Audio Studio',
+    search: 'Search',
+    art: 'Art',
+    daily: 'Daily',
+    monthly: 'Monthly',
+    annual: 'Annual',
+    saveNewPlan: 'Save New Plan',
+    none: 'None',
+    bestSeller: 'Best Seller',
+    popular: 'Popular',
+    unlimited: 'unlimited',
+    payWithBalance: 'Pay with Balance',
+    payWithPoints: 'Pay with Points',
+    upgrade: 'Upgrade',
+    confirmSubscription: 'Confirm Subscription',
+    confirmSubscriptionDesc: 'You are about to subscribe to the {plan} plan using your current balance.',
+    currentBalance: 'Current Balance',
+    planPrice: 'Plan Price',
+    remainingBalance: 'Remaining Balance',
+    confirmAndActivate: 'Confirm & Activate',
+    cancel: 'Cancel',
+    insufficientBalance: 'Insufficient balance to complete this transaction.',
+    subscriptionSuccess: 'Subscription Successful!',
+    quotaMilestoneTitle: 'Consumption {percentage}%',
+    quotaMilestone50: "You've used half of your limit for this tool!",
+    quotaMilestone90: 'Warning: You are almost at your full limit!',
+    quotaMilestone100: 'Limit Reached! Subsidized with balance.',
+    quotaMilestoneIncentive: 'Invite your friends to earn extra points and keep going without interruption.',
+    rewardFriends: 'Earn with Friends',
+    subscriptionSuccessDesc: 'Your plan has been activated successfully! Earn more points by inviting your friends.',
+    insufficientBalanceTitle: 'Insufficient Balance',
+    insufficientBalanceDesc: 'You don\'t have enough balance to subscribe. Invite friends to earn points and continue using our services.',
+    shareWithFriends: 'Share with Friends',
+    close: 'Close',
+    planForCreators: 'For Creators',
+    planForPros: 'For Advanced Users',
+    planForBusiness: 'For Businesses',
+    planColor: 'Plan Color',
+
+    searchUsers: 'Search users (name, email)...',
+    active: 'Active',
+    suspended: 'Suspended',
+    sendEmail: 'Send Email',
+    viewProfile: 'View Profile',
+    userProfile: 'User Profile',
+    plan: 'Plan',
+    changePlan: 'Change Plan',
+    adjustBalance: 'Adjust Balance',
+    accountActions: 'Account Actions',
+    suspendAccount: 'Suspend Account',
+    activateAccount: 'Activate Account',
+    joinedAt: 'Joined At',
+    lastLogin: 'Last Login',
+    usageStats: 'Usage Stats',
+    quickActions: 'Quick Actions',
+    emailSubject: 'Email Subject',
+    emailBody: 'Email Body',
+    send: 'Send',
+    saveChanges: 'Save Changes',
+
+    emailSettings: 'Email Settings',
+    emailTemplates: 'Email Templates',
+    broadcast: 'Broadcast',
+    smtpSettings: 'Provider Settings (SMTP/API)',
+    smtpHost: 'Host',
+    smtpPort: 'Port',
+    smtpUsername: 'Username',
+    smtpPassword: 'Password',
+    senderName: 'Sender Name',
+    senderEmail: 'Sender Email',
+    smtpTestConnection: 'Test Connection',
+    createNewTemplate: 'Create New Template',
+    templateName: 'Template Name',
+    variables: 'Available Variables',
+    editTemplate: 'Edit Template',
+    systemTemplates: 'System Templates',
+    customTemplates: 'Custom Templates',
+    welcomeEmail: 'Welcome Email',
+    resetPasswordEmail: 'Reset Password',
+    subscriptionSuccessEmail: 'Subscription Success',
+    sendTestEmail: 'Send Test Email',
+    mailerType: 'Mailer Type',
+    phpMail: 'PHP Mail',
+    smtp: 'SMTP Server',
+    encryption: 'Encryption',
+    noneEncryption: 'None',
+    ssl: 'SSL',
+    tls: 'TLS',
+    smtpDesc: 'Configure your email provider (SendGrid, AWS SES, Resend, etc.)',
+    securityProtocol: 'Security Protocol',
+    securityProtocolDesc: 'Email credentials are encrypted using AES-256 before being stored in the secure configuration file. They are never exposed to the frontend or stored in plaintext in the database.',
+    spamWarning: 'Ensure your provider allows sending from the specified "Sender Email" address to avoid emails landing in spam folders.',
+    clickToCopy: 'Click to copy and paste into your template.',
+    broadcastTitle: 'Broadcast Campaigns',
+    broadcastDesc: 'Send mass emails to specific user segments, announce new features, or run promotional campaigns directly from the hub.',
+    createCampaign: 'Create Campaign',
+    campaignName: 'Campaign Name',
+    selectTemplate: 'Select Template',
+    targetAudience: 'Target Audience',
+    byPlan: 'By Plan',
+    byActivity: 'By Activity',
+    activeUsers: 'Active Users',
+    inactiveUsers: 'Inactive Users',
+    sendCampaign: 'Send Campaign',
+    campaignHistory: 'Campaign History',
+    broadcastHistory: 'Broadcast History',
+    sent: 'Sent',
+    pendingBroadcast: 'Pending Broadcast',
+    failedBroadcast: 'Failed Broadcast',
+    recipients: 'Recipients',
+    totalSent: 'Total Sent',
+    successRate: 'Success Rate',
+    noCampaigns: 'No campaigns sent yet.',
+    confirmSendCampaign: 'Are you sure you want to send this campaign now? This might take some time depending on the recipient count.',
+    campaignStartSuccess: 'Campaign started successfully, you can track progress in the history.',
+    campaignStartError: 'Error starting the campaign.',
+    smartBroadcast: 'Smart Broadcast',
+    broadcastDescription: 'Send mass emails and instant notifications to your elite audience.',
+    newBroadcast: 'New Broadcast',
+    back: 'Back',
+    broadcastType: 'Broadcast Type',
+    broadcastEmail: 'Email',
+    broadcastNotification: 'In-App notification',
+    broadcastBoth: 'Both (Email & App)',
+    targetGroup: 'Target Group',
+    allUsers: 'All Users',
+    proOnly: 'PRO Users Only',
+    freeOnly: 'Free Users Only',
+    titleEn: 'Title (English)',
+    titleAr: 'Title (Arabic)',
+    contentEn: 'Content (English)',
+    contentAr: 'Content (Arabic)',
+    sendNow: 'Send Now',
+    loadingRecords: 'Loading records...',
+    noBroadcasts: 'No previous broadcasts found.',
+    launchFirstBroadcast: 'Launch your first broadcast now!',
+    broadcastSuccess: 'Broadcast sent successfully to {count} users',
+    totalBroadcasts: 'Total Campaigns',
+    totalReached: 'Total Reached',
+    activeStatus: 'Engine Status',
+    engineStatus: 'Operational Readiness',
+    ready: 'READY',
+    sentCount: 'sent',
+    lastActive: 'Last Active',
+    loginInLast: 'Logged in last',
+    days: 'days',
+    notLoginInLast: 'Not logged in last',
+    any: 'Any',
+    activeSubscription: 'Active Subscription',
+    suspendedSubscription: 'Suspended Account',
+    verifiedKYC: 'Verified Account (KYC)',
+    notVerifiedKYC: 'Not Verified Account',
+
+    visualIdentity: 'Visual Identity',
+    siteSettings: 'Site Settings',
+    siteName: 'Site Name',
+    siteDescription: 'Site Description',
+    logo: 'Logo',
+    favicon: 'Favicon',
+    seoFields: 'SEO Fields',
+    metaTags: 'Meta Tags',
+    uploadLogo: 'Upload Logo',
+    uploadFavicon: 'Upload Favicon',
+    saveSystemSettings: 'Save Settings',
+    generalSettings: 'General Settings',
+    seoDescriptionEn: 'SEO Description',
+    seoDescriptionAr: 'SEO Description (Arabic)',
+    keywordsEn: 'Keywords (comma-separated)',
+    keywordsAr: 'Keywords (Arabic, comma-separated)',
+    googleAnalyticsId: 'Google Analytics ID',
+    googleAnalyticsDesc: 'Example: G-XXXXXXXXXX',
+    googleSiteVerification: 'Google Site Verification',
+    googleSiteVerificationDesc: 'Enter your verification tag (e.g., google-site-verification=...) to verify console ownership.',
+    seoPreviewImageTitle: 'SEO & Social Share Preview Image (og:image)',
+    seoDragAndDrop: 'Drag & drop image here or click to browse',
+    seoSupportedFormats: 'Supported formats: PNG, JPG, WEBP',
+    seoBestPracticesTitle: 'Google & Meta Technical Best Practices:',
+    seoBestPracticesRecSize: 'Recommended Size:',
+    seoBestPracticesRecSizeDesc: '1200 × 630 px (retina ready)',
+    seoBestPracticesRatio: 'Aspect Ratio:',
+    seoBestPracticesRatioDesc: '1.91:1 (avoids vertical cropping)',
+    seoBestPracticesFileSize: 'Max File Size:',
+    seoBestPracticesFileSizeDesc: '2MB (optimizes search crawling and page speeds)',
+    seoSocialPreviewTitle: 'OG Link Preview (WhatsApp, Facebook, LinkedIn, Twitter):',
+    seoNoImageYet: 'No SEO preview image uploaded',
+    seoPreviewFooterNote: '* This interactive mockup illustrates the unified resolution and presentation of your page description with the asset when users share your domain link.',
+    seoRemoveImage: 'Remove Image',
+
+    monthlyRevenue: 'Monthly Revenue',
+    activeUsersToday: 'Active Users (Today)',
+    aiGenerations: 'AI Generations',
+    systemHealth: 'System Health',
+    optimal: 'Optimal',
+    databases: 'Databases',
+    coreDb: 'Core DB (Operational)',
+    ledgerDb: 'Ledger DB (Vault)',
+    connected: 'Connected',
+    aiQuotas: 'AI Provider Quotas',
+    viewAllTx: 'View All Transactions',
+    activityStream: 'Real-time Activity Stream',
+    securityAlerts: 'Security & Limit Violations',
+    systemUptime: 'System Uptime',
+    stableOperationalProtocol: 'Stable Operational Protocol',
+    financialRadarSubtitle: 'Live Economic Surveillance & Ledger Audit Protocol',
+    searchTxPlaceholder: 'Search transactions...',
+    searchActivityPlaceholder: 'Search activity stream & logs...',
+    walletAlertsEmpty: 'No critical wallet alerts.',
+    ledgerExpectation: 'Ledger Expectation',
+    noDiscrepancies: 'No financial discrepancies detected.',
+    liveLedgerAudit: 'Live Ledger Audit',
+    amountPointsLabel: 'Amount (Points)',
+    typeActionLabel: 'Type / Action',
+    maintenancePruneLegacy: 'Maintenance: Prune Legacy Notifs',
+    quickVelocity: 'Quick Velocity',
+    allBalancesSynced: 'All balances synchronized with ledger.',
+    noFinancialVectors: 'No financial vectors matching current filters.',
+    liveTransactionRegistry: 'Live Transaction Registry',
+    entityUser: 'Entity / User',
+    protocol: 'Protocol',
+    vector: 'Vector',
+    timestamp: 'Timestamp',
+    apiVaultTitle: 'AI API Keys Vault',
+    apiVaultDesc: 'Manage your AI provider API keys. All keys are AES-256 encrypted at rest and loaded in-memory for zero-latency execution.',
+    apiVaultProvider: 'Provider',
+    apiKey: 'API Key',
+    apiVaultTestConnection: 'Test Connection',
+    saveKey: 'Save & Encrypt',
+    keyEncrypted: 'Encrypted & Secure',
+    statusActive: 'Active',
+    statusMissing: 'Missing',
+    showKey: 'Show Key',
+    hideKey: 'Hide Key',
+    testing: 'Testing...',
+    needsVerification: 'Needs Verification',
+    currentUsage: 'Current Usage',
+    remaining: 'Remaining',
+    used: 'Used',
+    dailyBudgetPlaceholder: 'Daily Budget ($)',
+    budgetUpdateSuccess: 'Budget updated successfully',
+    budgetUpdateFailed: 'Failed to update budget',
+    connectionError: 'Connection error',
+    budget: 'Budget',
+    apiKeyLabel: 'API Key',
+    primaryEngine: 'Primary Engine',
+    fallbackProtocol: 'Fallback Protocol',
+    costPoints: 'Cost (Points)',
+    enterKeyPlaceholder: 'Enter key here...',
+    syncModels: 'Sync Models',
+    saveKeyBtn: 'Save Key',
+    syncUsageLimits: 'Sync Usage Limits',
+    ollamaUrlLabel: 'Ollama Cloud Hub Endpoint',
+    ollamaCloudHint: 'Note: Enter your full Ollama Cloud instance URL here. Localhost is used as fallback only.',
+    dbOrchestrationTitle: 'Databases',
+    dbOrchestrationDesc: 'Manage core and ledger database connections. Credentials are encrypted locally for maximum security and separation of concerns.',
+    coreDbTitle: 'Core Database',
+    externalDbTitle: 'External Categories Database',
+    securityDbTitle: 'Defense & Security Database',
+    coreDbLocalTitle: 'Core DB (Local) - PostgreSQL',
+    ledgerDbLocalTitle: 'Ledger DB (Local) - PostgreSQL',
+    coreDbCloudTitle: 'Core DB (Cloud) - PostgreSQL',
+    ledgerDbCloudTitle: 'Ledger DB (Cloud) - PostgreSQL',
+    coreDbDesc: 'Operational Data (Users, Chats, Logs)',
+    ledgerDbDesc: 'Financial Data (Wallets, Transactions, Balances)',
+    externalDbDesc: 'External Integrations & Isolated Third-party Services',
+    securityDbDesc: 'Security Logs, Rate Limiter lists & Blacklists',
+    dbHost: 'Host',
+    dbPort: 'Port',
+    dbUsername: 'Username',
+    dbPassword: 'Password',
+    dbName: 'Database Name',
+    connectionStringPlaceholder: 'postgresql://user:pass@host:port/db',
+    sslMode: 'SSL Mode',
+    sslRequire: 'Require',
+    sslDisable: 'Disable',
+    poolSize: 'Pool Size',
+    testDbConnection: 'Test Connection',
+    saveDbConfig: 'Save Settings',
+    migrateScratch: 'Wipe & Rebuild (From Scratch)',
+    migrateAdditive: 'Sync Schema (Additive)',
+    migrateScratchDesc: 'Total purge and reconstruction of all tables/schemas.',
+    migrateAdditiveDesc: 'Sync structure and apply patches without data loss.',
+    statusConnected: 'Connected',
+    statusDisconnected: 'Disconnected',
+    cloud: 'Cloud',
+    local: 'Local',
+    cloudModeHint: 'In Cloud Mode, the system relies exclusively on the full Connection String (URI).',
+    activate: 'Activate (Active)',
+    deactivate: 'Deactivate',
+    standby: 'Standby',
+    cloudAutoScalingEnabled: 'Auto-scaling enabled for Cloud',
+    connectionString: 'Connection String (PRIMARY)',
+    connectionUrl: 'Full Connection URL',
+    dbTestSuccess: 'Connection successful!',
+    dbTestFailed: 'Connection failed: please check credentials.',
+    dbTestError: 'Technical error during connection attempt.',
+    dbSaveSuccess: 'Database configuration saved successfully.',
+    dbSaveFailed: 'Failed to save configuration.',
+    dbSaveError: 'System error during save.',
+    dbMigrationSuccess: 'Database schema updated successfully.',
+    dbMigrationFailed: 'Failed to run migrations.',
+    dbMigrationError: 'Error during migrations execution.',
+    primaryDbDesc: 'Primary database for live production operations.',
+    shadowDbDesc: 'Synchronized shadow copy for emergency data persistence.',
+    core_shadowDbTitle: 'Core Shadow (Backup)',
+    ledger_shadowDbTitle: 'Ledger Shadow (Backup)',
+    ledgerDbTitle: 'Ledger Database (Financial)',
+    toolOrchestratorTitle: 'Tool Routing (The Silent Router)',
+    toolOrchestratorDesc: 'Smart Routing System. Define primary and fallback models for each tool to ensure zero downtime.',
+    orchestratorProvider: 'Provider',
+    model: 'Model',
+    fallbackSubtitle: 'Fallback Providers (Activates on failure or 99% usage)',
+    fallback1: 'Fallback 1',
+    fallback2: 'Fallback 2',
+    fallback3: 'Fallback 3',
+    orchestratorSave: 'Save',
+    tools: 'Tools',
+    toolCode: 'Code',
+    toolCodeDesc: 'Tool for writing and reviewing code',
+    withdrawableBalance: 'Withdrawable Balance',
+    requestWithdrawal: 'Request Withdrawal',
+    pointsBalance: 'Points Balance',
+    convertPointsToBalance: 'Convert Points to Balance',
+    howSystemWorks: 'How the system works?',
+    shareYourLink: 'Share your link',
+    shareYourLinkDesc: 'Send the link to your friends or post it on social media',
+    registration: 'Registration',
+    registrationDesc: 'When your friend registers, they get {welcomeBonus} welcome points',
+    activationAndProfit: 'Activation and Profit',
+    activationAndProfitDesc: 'Once your friend activates their account, you get {referralBonus} points',
+    inviteFriendsAndEarn: 'Invite Friends and Earn',
+    inviteFriendsDesc: 'Get {referralBonus} points for every friend who registers through you. They will also get {welcomeBonus} points!',
+    yourReferralLink: 'Your Referral Link',
+    copy: 'Copy',
+    copied: 'Copied',
+    totalSuccessfulReferralsUser: 'Total Successful Referrals',
+    transactionHistory: 'Transaction History',
+    noTransactionsYet: 'No transactions yet. Start inviting friends to earn points!',
+    transactionsWillAppearHere: 'Your transactions will appear here once you start using points.',
+    userName: 'User Name',
+    userEmail: 'Email',
+    status: 'Status',
+    date: 'Date',
+    withdrawalHistory: 'Withdrawal History',
+    pointsConversionHistory: 'Points Conversion History',
+    pendingBroadcastHistory: 'Pending (History)',
+    completed: 'Completed',
+    failedOrBlocked: 'Failed',
+    convertPoints: 'Convert Points',
+    numberOfPoints: 'Number of Points',
+    currentBalancePoints: 'Current Balance: {points} points',
+    confirmConversion: 'Confirm Conversion',
+    withdrawBalance: 'Withdraw Balance',
+    withdrawalAmount: 'Withdrawal Amount',
+    minWithdrawalAmount: 'Minimum withdrawal: {min}',
+    withdrawalMethod: 'Withdrawal Method',
+    paypalUser: 'PayPal',
+    crypto: 'Crypto (USDT)',
+    bankAccount: 'Bank Account',
+    paymentDetails: 'Payment Details',
+    paypalEmailPlaceholder: 'Enter PayPal email...',
+    cryptoAddressPlaceholder: 'Enter wallet address (USDT TRC20)...',
+    bankDetailsPlaceholder: 'Enter IBAN...',
+    sendRequest: 'Send Request',
+    kycVerification: 'Identity Verification (KYC)',
+    kycThresholdNote: 'Only required for withdrawals over $100',
+    kycDescription: 'To protect our community and prevent financial fraud, we adhere to the highest security and compliance standards. Please verify your identity to safely withdraw your earnings.',
+    fullNameAsPerIdUser: 'Full Name (As per ID or Passport)',
+    takeSelfieWithId: 'Take Selfie with ID',
+    selfieSecurityNote: 'We require a live selfie instead of file uploads to ensure maximum security and protect the system from malicious files. In compliance with UK Data Protection laws (UK GDPR & Data Protection Act 2018), we confirm that no images are stored on our servers. Images are transmitted directly to the administrator for verification and are immediately discarded from memory.',
+    submitKyc: 'Submit Verification Request',
+    selfieCaptured: 'Selfie Captured Successfully',
+    capture: 'Capture Image',
+
+    userSettings: 'Account Settings',
+    profile: 'Profile',
+    aiPreferences: 'AI Preferences',
+    appPreferences: 'App Preferences',
+    preferences: 'Preferences',
+    intelligenceCalibration: 'Intelligence Calibration',
+    languagePreference: 'Language Preference',
+    themePreference: 'Visual Theme',
+    professionalIdentity: 'Professional Identity',
+    eliteResponseStyles: 'Elite Response Styles',
+    activeNow: 'Active Now',
+    updateProfile: 'Update Profile',
+    customInstructions: 'Custom Instructions',
+    customInstructionsDesc: 'Tell the assistant about yourself and your preferences (e.g., "I am a developer, give me code directly without long explanations").',
+    memoryLog: 'Memory Log',
+    memoryLogDesc: 'This is what the assistant has learned about you and your working style. You can edit or clear it at any time.',
+    memoryLogPlaceholder: 'No memory recorded yet...',
+    memoryAutoUpdateNote: 'Note: The assistant updates this log automatically based on your conversations to ensure context continuity.',
+    clearMemory: 'Clear Memory',
+    customInstructionsPlaceholder: 'e.g., I am a senior React developer. Please provide code snippets without explanations unless I ask for them.',
+    theme: 'Theme',
+    language: 'Language',
+    lightMode: 'Light',
+    darkMode: 'Dark',
+    systemMode: 'System',
+    arabic: 'العربية',
+    english: 'English',
+    termsOfUse: 'Terms of Service',
+    privacyPolicy: 'Privacy Policy',
+    cookiesPolicy: 'Cookies Policy',
+
+    consumptionRadar: 'Consumption Radar',
+    realTimeSync: 'Live Resource Synchronization',
+    liveNow: 'LIVE NOW',
+    currentPlan: 'CURRENT PLAN',
+    subscriptionCycle: 'SUBSCRIPTION CYCLE',
+    daysRemaining: '{days} days remaining',
+    limitless: 'LIMITLESS',
+    of: 'OF',
+    usageLoad: 'USAGE LOAD',
+    noActiveRadar: 'No Active Radar',
+    noActiveRadarDesc: 'Subscribe to one of our plans to activate the consumption radar and live sync.',
+    resourceResetProtocol: 'RESOURCE RESET PROTOCOL',
+    resourceResetDesc: 'Consumption counters are recalibrated daily at 00:00 UTC to maintain resource integrity.',
+    log_user_login: 'Logged into the system',
+    log_user_registration: 'Joined as a new user',
+    log_notifications_prune: 'Oracle PRUNE (Notifications)',
+    log_wallet_reconciliation: 'Manual wallet reconciliation',
+    log_subscription_payment: 'Activated paid subscription',
+    log_user_permissions_update: 'Updated user permissions',
+    log_ai_generation: 'AI Generation',
+    log_used_tool: 'Used tool: {tool}',
+    log_notifications_prune_detail: 'Manual prune of legacy notifications',
+    log_login_detail: 'Successful system login',
+    log_registration_detail: 'New membership registration',
+    clearAILogs: 'Clear AI Logs',
+    clearSystemLogs: 'Clear System Logs',
+    clearAll: 'Clear All',
+    noSecurityAlerts: 'No security alerts currently.',
+    noActivityLogged: 'No activity logged currently.',
+    systemUser: 'System',
+    alert_usage_anomaly: 'Security Breach: Usage Anomaly',
+    alert_quota_bypass: 'Security Breach: Quota Bypass',
+    alert_ledger_discrepancy: 'Finance Alert: Ledger Mismatch',
+    alert_unauthorized_access: 'Unauthorized Access Attempt',
+    alert_failed_login: 'Multiple Failed Logins',
+    toastKeySaveSuccess: 'Saved',
+    toastKeySaveError: 'Save failed: {error}',
+    toastKeyDeleteSuccess: 'Deleted',
+    toastKeyDeleteError: 'Delete failed',
+    keyDeleteConfirm: 'Are you sure you want to delete the {provider} key? This will stop the associated tools.',
+    toastDbTestSuccess: 'Connected',
+    toastDbTestFailed: 'Connection failed: {error}',
+    toastDbSaveSuccess: 'Saved',
+    toastPlanSaveSuccess: 'Saved',
+    toastEconomySaveSuccess: 'Saved',
+    toastStripeSaveSuccess: 'Saved',
+    toastAllFieldsRequired: 'All translation fields (Names & Descriptions) are required',
+    toastPricingRequired: 'Pricing fields are required',
+    toastFeatureRequired: 'At least one feature is required',
+    toastFeatureTranslationRequired: 'All features must have both English and Arabic text',
+    deletePlanConfirm: 'Are you sure you want to delete this plan?',
+    toastPlanDeleteSuccess: 'Plan deleted successfully',
+    toastPlanDeleteError: 'Failed to delete plan',
+    loadingCommandCenter: 'Fetching command center data...',
+    resourceUtilization: 'Resource Utilization',
+    serverMonitoringActive: 'Real-time server monitoring active.',
+    deleteLogConfirm: 'Are you sure you want to delete this log?',
+    deleteAlertConfirm: 'Delete this security alert?',
+    reconcileConfirm: 'Start wallet reconciliation? This will recalibrate user balance based strictly on ledger transactions.',
+    reconcileSuccess: 'Reconciliation successful. Balance updated.',
+    activityCleared: 'Activity logs cleared successfully',
+    alertsCleared: 'Security alerts cleared',
+    selectAll: 'Select All',
+    batchDeleteConfirm: 'Are you sure you want to delete {count} selected items?',
+    batchDeleteSuccess: 'Successfully deleted {count} items.',
+    deleteSelected: 'Delete Selected',
+    systemMaintenance: 'System Maintenance',
+    pruneSuccess: 'System notifications pruned successfully',
+    bulkDeleteActivityConfirm: 'Are you sure you want to clear ALL {type} logs? This cannot be undone.',
+    bulkDeleteAlertsConfirm: 'Are you sure you want to clear ALL security alerts? This will wipe the monitoring history.',
+    maintenanceClearAllNotifs: 'Maintenance: Wipe All Notifications',
+    clearNotifsConfirm: 'Are you sure you want to permanently delete ALL system notifications for all users?',
+    clearAllChats: 'Purge Cloud Memory (All Chats)',
+    clearAllChatsConfirm: 'WARNING: This will delete ALL chat history and messages from the database. Are you sure?',
+    syncSuccess: 'Synchronization Successful',
+    syncError: 'Synchronization Failed',
+    syncingData: 'Syncing data...',
+    syncModelsFound: 'Found {count} models for {provider}',
+    syncUsageStats: 'Usage: ${used} of ${total} budget',
+    saveData: 'Save Data',
+    lastSync: 'Last Sync',
+    remember_me: 'Remember me',
+    cpuLoad: 'CPU Load',
+    memoryAllocation: 'Memory Allocation',
+    systemLoad: 'System Load',
+    mood_epic: 'Epic',
+    mood_dramatic: 'Dramatic',
+    mood_corporate: 'Corporate',
+    mood_chill: 'Chill',
+    mood_energetic: 'Energetic',
+    mood_romantic: 'Romantic',
+    vocal_none: 'None',
+    vocal_male: 'Male',
+    vocal_female: 'Female',
+    vocal_robot: 'Robot',
+    vocal_professional: 'Professional',
+    mood: 'Mood',
+    vocalType: 'Vocal Type',
+    audioDuration: 'Duration',
+    testConnection: 'Test Connection',
+    siteFavicon: 'Favicon',
+    engineHealth: 'Engine Health',
+    utilizationRate: 'Utilization Rate',
+    pendingHistory: 'Pending History',
+    failedStatus: 'Failed Status',
+    category: 'Category',
+    activePlan: 'Active Plan',
+    noPlan: 'No Plan',
+    retry: 'Retry',
+    logDeleted: 'Log Deleted',
+    dbActivateSuccess: 'Database activated successfully',
+    dbDeactivateSuccess: 'Database deactivated successfully',
+    environment: 'Environment',
+    allFieldsRequired: 'All fields are required',
+    discover: 'Discover',
+    studio: 'Studio',
+    subscriptions: 'Subscriptions',
+    invalidRequest: 'Invalid Request',
+    backToHome: 'Back to Home',
+    type: 'Type',
+    description: 'Description',
+    loadMore: 'Load More',
+  }
+};
+
+const AppContext = createContext<AppContextType | undefined>(undefined);
+
+export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [language, setLanguage] = useState<Language>(() => {
+    try { return (secureStorage.getSync('language') as Language) || 'en'; } catch (e) { return 'en'; }
+  });
+  const [languageTransitioning, setLanguageTransitioning] = useState<boolean>(false);
+  const [theme, setThemeState] = useState<Theme>(() => {
+    try {
+      return (
+        (secureStorage.getSync('perplexta_theme') as Theme) ||
+        (secureStorage.getSync('theme') as Theme) ||
+        'light'
+      );
+    } catch {
+      return 'light';
+    }
+  });
+  const [resolvedTheme, setResolvedTheme] = useState<'dark' | 'light'>(() => ThemeSync.resolve(theme));
+  const [themeTransitioning, setThemeTransitioning] = useState<boolean>(false);
+
+  const setThemeContext = useCallback((newTheme: Theme) => {
+    setThemeTransitioning(true);
+    setThemeState(newTheme);
+    try {
+      secureStorage.set('perplexta_theme', newTheme);
+    } catch (e) {}
+    const res = ThemeSync.resolve(newTheme);
+    setResolvedTheme(res);
+    ThemeSync.apply(newTheme);
+
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        setThemeTransitioning(false);
+      }, 160);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const handleSystemThemeChange = () => {
+      if (theme === 'system') {
+        const res = ThemeSync.resolve('system');
+        setResolvedTheme(res);
+        ThemeSync.apply('system');
+      }
+    };
+    if (mediaQuery.addEventListener) {
+      mediaQuery.addEventListener('change', handleSystemThemeChange);
+    } else {
+      (mediaQuery as any).addListener(handleSystemThemeChange);
+    }
+    return () => {
+      if (mediaQuery.removeEventListener) {
+        mediaQuery.removeEventListener('change', handleSystemThemeChange);
+      } else {
+        (mediaQuery as any).removeListener(handleSystemThemeChange);
+      }
+    };
+  }, [theme]);
+  const [showInactivityWarning, setShowInactivityWarning] = useState(false);
+  const [inactivityCountdown, setInactivityCountdown] = useState(60);
+
+  const showWarningRef = useRef(showInactivityWarning);
+  useEffect(() => {
+    showWarningRef.current = showInactivityWarning;
+  }, [showInactivityWarning]);
+
+  const extendSession = () => {
+    secureStorage.set('perplexta_last_activity', Date.now().toString());
+    setShowInactivityWarning(false);
+  };
+
+  const [user, setUser] = useState<User | null>(() => {
+    try {
+      const stored = secureStorage.getSync('app_user_profile');
+      if (stored && stored !== 'null' && stored !== 'undefined') {
+        const parsed = JSON.parse(stored);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  });
+  const userRef = useRef<User | null>(user);
+  const isSyncingAuth = useRef(false);
+  const lastSessionStartRef = useRef<{ path: string; time: number } | null>(null);
+
+  const logUserActivity = useCallback(async (eventType: string, eventDetails?: any) => {
+    try {
+      if (eventType === 'SESSION_START') {
+        const currentPath = eventDetails?.path || (typeof window !== 'undefined' ? window.location.pathname : '');
+        const now = Date.now();
+        if (
+          lastSessionStartRef.current &&
+          lastSessionStartRef.current.path === currentPath &&
+          now - lastSessionStartRef.current.time < 30000
+        ) {
+          return; // Throttled duplicate session start within 30 seconds
+        }
+        lastSessionStartRef.current = { path: currentPath, time: now };
+      }
+
+      const rawId = userRef.current?.id;
+      const numericUserId = typeof rawId === 'number' && rawId > 0
+        ? rawId
+        : (typeof rawId === 'string' && /^\d+$/.test(rawId) && parseInt(rawId, 10) > 0 ? parseInt(rawId, 10) : null);
+
+      await fetch('/api/activity/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          eventType,
+          eventDetails,
+          userId: numericUserId
+        })
+      });
+    } catch (err) {
+      // Silent telemetry catch
+    }
+  }, []);
+
+  useEffect(() => {
+    logUserActivity('SESSION_START', { path: window.location.pathname });
+  }, [logUserActivity]);
+  useEffect(() => {
+    userRef.current = user;
+    try {
+      if (user) {
+        secureStorage.set('app_user_profile', JSON.stringify(user));
+      } else {
+        secureStorage.remove('app_user_profile');
+      }
+    } catch (e) {
+
+    }
+  }, [user]);
+
+  const isJwtExpired = (jwtToken: string | null): boolean => {
+    if (!jwtToken || jwtToken === 'null' || jwtToken === 'undefined' || jwtToken === '') return true;
+    try {
+      const parts = jwtToken.split('.');
+      if (parts.length !== 3) return false;
+      const base64Url = parts[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const jsonPayload = decodeURIComponent(
+        atob(base64)
+          .split('')
+          .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+          .join('')
+      );
+      const parsed = JSON.parse(jsonPayload);
+      if (!parsed || !parsed.exp) return false;
+      return (parsed.exp * 1000) <= (Date.now() + 5000);
+    } catch {
+      return false;
+    }
+  };
+
+  const [token, setToken] = useState<string | null>(() => {
+    try {
+      const rawToken = secureStorage.getSync('app_token');
+      if (!rawToken || rawToken === 'null' || rawToken === 'undefined' || rawToken === '') return null;
+      if (isJwtExpired(rawToken)) {
+        secureStorage.remove('app_token');
+        secureStorage.remove('app_refresh_token');
+        return null;
+      }
+      return rawToken;
+    } catch (e) {
+      return null;
+    }
+  });
+  const [refreshToken, setRefreshTokenState] = useState<string | null>(() => {
+    try {
+      const rawRT = secureStorage.getSync('app_refresh_token');
+      if (!rawRT || rawRT === 'null' || rawRT === 'undefined' || rawRT === '') return null;
+      return rawRT;
+    } catch (e) {
+      return null;
+    }
+  });
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const [usePollingFallback, setUsePollingFallback] = useState<boolean>(() => {
+    try {
+      return secureStorage.getSync('socket_polling_fallback') === 'true';
+    } catch (e) {
+      return false;
+    }
+  });
+  const [isAuthReady, setIsAuthReady] = useState<boolean>(false);
+  const bootStartTime = useRef(Date.now());
+
+  const completeBoot = (force = false) => {
+    setIsAuthReady(true);
+  };
+  const [balance, setBalance] = useState<number>(() => {
+    try {
+      const stored = secureStorage.getSync('app_user_profile');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && typeof parsed === 'object' && parsed.points !== undefined) {
+          return Number(parsed.points || 0);
+        }
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
+  });
+  const [balanceUSD, setBalanceUSD] = useState<number>(() => {
+    try {
+      const stored = secureStorage.getSync('app_user_profile');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && typeof parsed === 'object' && parsed.balance !== undefined) {
+          return Number(parsed.balance || 0);
+        }
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
+  });
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [isIOS] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+           (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  });
+  const [standaloneWebviewState, setStandaloneWebviewState] = useState<StandaloneWebviewDetection>(detectStandaloneWebview());
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleDetectionUpdate = () => {
+      setStandaloneWebviewState(detectStandaloneWebview());
+    };
+
+    handleDetectionUpdate();
+    window.addEventListener('resize', handleDetectionUpdate);
+    const mql = window.matchMedia('(display-mode: standalone)');
+    mql.addEventListener?.('change', handleDetectionUpdate);
+
+    return () => {
+      window.removeEventListener('resize', handleDetectionUpdate);
+      mql.removeEventListener?.('change', handleDetectionUpdate);
+    };
+  }, []);
+  const [isOperationPending, setIsOperationPending] = useState(false);
+
+  const [economySettings, setEconomySettings] = useState<any>(() => {
+    try {
+      const cached = secureStorage.getSync('app_economy_settings');
+      if (cached) return JSON.parse(cached);
+    } catch {}
+    return { 
+      welcome_bonus_points: 600, 
+      referral_bonus_points: 1000, 
+      points_per_dollar: 1000, 
+      conversion_rate: 0.001 
+    };
+  });
+
+  const [memoryNotification, setMemoryNotification] = useState<{
+    isVisible: boolean;
+    type: 'success' | 'warning' | 'cleanup' | 'optimization' | 'startup';
+    desc?: string;
+  }>({
+    isVisible: false,
+    type: 'success'
+  });
+
+  const triggerMemoryNotification = (_type: 'success' | 'warning' | 'cleanup' | 'optimization' | 'startup', _desc?: string) => {
+    // SILENCED FOR CLEANER MOBILE EXPERIENCE AND STORE COMPLIANCE
+    setMemoryNotification({ isVisible: false, type: 'success' });
+  };
+
+  const closeMemoryNotification = () => {
+    setMemoryNotification(prev => ({ ...prev, isVisible: false }));
+  };
+
+  const upgradePromptState = {
+    isOpen: false,
+    toolId: '',
+  };
+  const setUpgradePromptState = () => {};
+  const triggerUpgradePrompt = () => {};
+  const closeUpgradePrompt = () => {};
+  const [rememberMe, setRememberMe] = useState<boolean>(() => {
+    try {
+      return secureStorage.getSync('app_remember_me') === 'true' || secureStorage.getSync('app_remember') === 'true';
+    } catch (e) {
+      return false;
+    }
+  });
+
+  const dir = language === 'ar' ? 'rtl' : 'ltr';
+
+  const handleLanguageChange = async (lang: Language) => {
+    // 1. Begin fade-out phase
+    setLanguageTransitioning(true);
+    
+    // 2. Wait 150ms for the UI to completely fade to 0 opacity in the background
+    setTimeout(async () => {
+      // 3. Apply the language swap in the dark (when the content is fully invisible)
+      setLanguage(lang);
+      secureStorage.set('language', lang); 
+      
+      if (token) {
+        try {
+          await fetch('/api/user/profile', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify({ language: lang })
+          });
+        } catch (e) {
+          // Silence profile update errors safely
+        }
+      }
+      
+      // 4. Wait a tiny 80ms fraction for the browser layout to calculate direction & sidebar alignment in the dark
+      setTimeout(() => {
+        // 5. Begin fade-in phase
+        setLanguageTransitioning(false);
+      }, 80);
+    }, 150);
+  };
+
+  const handleThemeChange = async (newTheme: Theme) => {
+    setThemeContext(newTheme);
+    if (token) {
+      try {
+        await fetch('/api/user/profile', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({ theme: newTheme })
+        });
+      } catch (e) {}
+    }
+  };
+
+  const [isSidebarOpen, setIsSidebarOpenState] = useState<boolean>(false);
+
+  const setIsSidebarOpen = useCallback((isOpen: boolean | ((prev: boolean) => boolean)) => {
+    setIsSidebarOpenState((prev) => {
+      return typeof isOpen === 'function' ? isOpen(prev) : isOpen;
+    });
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isOperationPending) {
+        e.preventDefault();
+        e.returnValue = ''; 
+        return '';
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isOperationPending]);
+
+  const triggerAuthSuccessToast = (_type: 'login' | 'signup') => {
+    // SILENCED FOR STORE COMPLIANCE AND CLEAN UNINTERRUPTED USER EXPERIENCE
+  };
+
+  const handleAuthSuccess = (userData: any) => {
+    if (isSyncingAuth.current) return;
+    isSyncingAuth.current = true;
+
+    const { token: newToken, refreshToken: newRefreshToken, lang: authLang, ...info } = userData;
+    secureStorage.set('app_token', newToken);
+    setToken(newToken);
+    if (newRefreshToken) {
+      secureStorage.set('app_refresh_token', newRefreshToken);
+      setRefreshTokenState(newRefreshToken);
+    }
+    setUser(info);
+    secureStorage.set('last_active_tool', 'chat_fast');
+    setIsAuthModalOpen(false); 
+
+    try {
+      trackLoginEvent(info.id || info._id || 'unknown', info.role || 'user', 'google');
+    } catch (e) {
+      console.error('[Analytics Error]:', e);
+    }
+
+    if (authLang && (authLang === 'ar' || authLang === 'en')) {
+      setLanguage(authLang as any);
+      secureStorage.set('language', authLang);
+    }
+
+    const targetRefRaw = userData.ref || secureStorage.getSync('app_ref');
+
+    const targetRef = targetRefRaw && targetRefRaw.startsWith('/') && !targetRefRaw.startsWith('//') ? targetRefRaw : null;
+    secureStorage.remove('app_ref');
+
+    const currentPath = window.location.pathname;
+
+    const normalizePath = (p: string) => {
+      let clean = p.replace(/\/$/, "");
+      if (clean === "" || clean === "/chats") return "/chat";
+      return clean;
+    };
+
+    const normCurrent = normalizePath(currentPath);
+    const normTarget = targetRef ? normalizePath(targetRef) : normCurrent;
+
+    const isSamePage = !targetRef || 
+                       normCurrent === normTarget || 
+                       (normCurrent.startsWith('/chat') && normTarget.startsWith('/chat'));
+
+    setTimeout(() => {
+      isSyncingAuth.current = false;
+      if (isSamePage) {
+        triggerAuthSuccessToast('login');
+      } else {
+        secureStorage.set('app_force_refresh', '1');
+        window.location.href = targetRef || '/';
+      }
+    }, 50);
+  };
+
+  useEffect(() => {
+    const getParam = (name: string) => {
+      const searchParams = new URLSearchParams(window.location.search);
+      if (searchParams.get(name)) return searchParams.get(name);
+
+      const hash = window.location.hash;
+      if (hash.includes('?')) {
+        const hashQueryParams = new URLSearchParams(hash.split('?')[1]);
+        return hashQueryParams.get(name);
+      }
+      return null;
+    };
+
+    const urlToken = getParam('token');
+    const urlRefreshToken = getParam('refreshToken');
+    const urlUserRaw = getParam('user');
+
+    const isSensitivePage = window.location.pathname.includes('reset-password');
+
+    const isOAuthCallback = window.opener !== null || 
+      document.referrer.includes(window.location.origin) ||
+      window.location.search.includes('oauth=1');
+
+    if (urlToken && !isSensitivePage && urlToken !== token && isOAuthCallback) {
+      secureStorage.set('app_token', urlToken);
+      setToken(urlToken);
+      if (urlRefreshToken) {
+        secureStorage.set('app_refresh_token', urlRefreshToken);
+        setRefreshTokenState(urlRefreshToken);
+      }
+
+      let userData = null;
+      if (urlUserRaw) {
+        try {
+          userData = JSON.parse(decodeURIComponent(urlUserRaw));
+          setUser(userData);
+        } catch (e) {
+
+        }
+      }
+
+      if (window.opener && window.opener !== window) {
+        window.opener.postMessage({ 
+          type: 'OAUTH_AUTH_SUCCESS', 
+          user: { token: urlToken, ...userData } 
+        }, window.location.origin);
+
+        const authChannel = new BroadcastChannel('app_oauth_channel');
+        authChannel.postMessage({ 
+          type: 'OAUTH_AUTH_SUCCESS', 
+          user: { token: urlToken, ...userData } 
+        });
+
+        setTimeout(() => window.close(), 500);
+      } else {
+        handleAuthSuccess({ token: urlToken, ...userData });
+        const newUrl = window.location.pathname + (window.location.hash.includes('?') ? window.location.hash.split('?')[0] : window.location.hash);
+        window.history.replaceState({}, '', newUrl);
+      }
+    }
+
+    const ref = getParam('ref');
+    if (ref) secureStorage.set('app_ref', ref);
+
+    const messageListener = (event: MessageEvent) => {
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
+        handleAuthSuccess(event.data.user);
+      }
+    };
+
+    const authChannel = new BroadcastChannel('app_oauth_channel');
+    authChannel.onmessage = (event) => {
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
+        handleAuthSuccess(event.data.user);
+      }
+    };
+
+    const storageListener = (event: StorageEvent) => {
+      if (event.key === 'app_oauth_trigger' && event.newValue) {
+        const storedToken = secureStorage.getSync('app_token');
+        const userDataJson = secureStorage.getSync('app_oauth_user');
+        if (storedToken && userDataJson) {
+          try {
+            const userData = JSON.parse(userDataJson);
+            const processedUser = userData.user ? { token: userData.token, ...userData.user } : userData;
+            handleAuthSuccess(processedUser);
+            secureStorage.remove('app_oauth_user');
+            secureStorage.remove('app_oauth_trigger');
+          } catch (e) {  }
+        }
+      }
+    };
+
+    window.addEventListener('message', messageListener);
+    window.addEventListener('storage', storageListener);
+
+    return () => {
+      authChannel.close();
+      window.removeEventListener('message', messageListener);
+      window.removeEventListener('storage', storageListener);
+    };
+  }, [dir]);
+
+  const refreshPromiseRef = useRef<Promise<string | null> | null>(null);
+
+  useEffect(() => {
+    const handleTokenRefreshed = (e: Event) => {
+      const customEvent = e as CustomEvent<{ token: string; refreshToken?: string }>;
+      if (customEvent.detail?.token) {
+        setToken(customEvent.detail.token);
+      }
+      if (customEvent.detail?.refreshToken) {
+        setRefreshTokenState(customEvent.detail.refreshToken);
+      }
+    };
+
+    const handleSessionExpired = () => {
+      logout(false);
+    };
+
+    window.addEventListener('app_token_refreshed', handleTokenRefreshed);
+    window.addEventListener('app_session_expired', handleSessionExpired);
+    return () => {
+      window.removeEventListener('app_token_refreshed', handleTokenRefreshed);
+      window.removeEventListener('app_session_expired', handleSessionExpired);
+    };
+  }, []);
+
+  const silentRefreshToken = async (): Promise<string | null> => {
+    if (refreshPromiseRef.current) {
+      return refreshPromiseRef.current;
+    }
+
+    const currentRefreshToken = secureStorage.getSync('app_refresh_token');
+    if (!currentRefreshToken) {
+      return null;
+    }
+
+    const performRefresh = async (): Promise<string | null> => {
+      try {
+        const newToken = await performSilentTokenRefresh();
+        if (newToken) {
+          setToken(newToken);
+          const freshRefreshToken = secureStorage.getSync('app_refresh_token');
+          if (freshRefreshToken) {
+            setRefreshTokenState(freshRefreshToken);
+          }
+          return newToken;
+        }
+        return null;
+      } catch (err) {
+        return null;
+      } finally {
+        refreshPromiseRef.current = null;
+      }
+    };
+
+    refreshPromiseRef.current = performRefresh();
+    return refreshPromiseRef.current;
+  };
+
+  const tokenRef = useRef<string | null>(null);
+  useEffect(() => { tokenRef.current = token; }, [token]);
+
+  useEffect(() => {
+    const originalFetch = window.fetch;
+    const customFetch = async (...args: any[]) => {
+      let [resource, config] = args;
+
+      const isDataSaver = userRef.current?.data_saver || localStorage.getItem('data_saver_enabled') === 'true';
+      if (isDataSaver) {
+        if (resource instanceof Request) {
+          resource.headers.set('Save-Data', 'on');
+          resource.headers.set('X-Data-Saver', 'true');
+        } else {
+          if (!config) config = {};
+          if (!config.headers) config.headers = {};
+          if (config.headers instanceof Headers) {
+            config.headers.set('Save-Data', 'on');
+            config.headers.set('X-Data-Saver', 'true');
+          } else if (Array.isArray(config.headers)) {
+            config.headers.push(['Save-Data', 'on'], ['X-Data-Saver', 'true']);
+          } else {
+            config.headers['Save-Data'] = 'on';
+            config.headers['X-Data-Saver'] = 'true';
+          }
+        }
+      }
+
+      const urlStr = typeof resource === 'string' 
+        ? resource 
+        : (resource instanceof Request ? resource.url : '');
+
+      const isRefreshRequest = urlStr.includes('refresh-token');
+
+      let isRetry = false;
+      if (config && config.headers) {
+        if (config.headers instanceof Headers) {
+          isRetry = config.headers.has('X-Is-Retry');
+        } else if (Array.isArray(config.headers)) {
+          isRetry = config.headers.some(([key]: [string, string]) => key.toLowerCase() === 'x-is-retry');
+        } else {
+          isRetry = !!(config.headers as any)['X-Is-Retry'];
+        }
+      }
+
+      const response = await originalFetch(resource, config);
+
+      if (response.status === 401 && !isRefreshRequest && !isRetry) {
+        const clone = response.clone();
+        try {
+          const json = await clone.json();
+          if (json.error === 'TokenExpiredError') {
+
+            const newToken = await silentRefreshToken();
+            if (newToken) {
+              const newConfig = { ...config } as any;
+
+              if (resource instanceof Request) {
+                resource.headers.set('Authorization', `Bearer ${newToken}`);
+                resource.headers.set('X-Is-Retry', 'true');
+              } else {
+                if (!newConfig.headers) {
+                  newConfig.headers = {};
+                }
+
+                if (newConfig.headers instanceof Headers) {
+                  newConfig.headers.set('Authorization', `Bearer ${newToken}`);
+                  newConfig.headers.set('X-Is-Retry', 'true');
+                } else if (Array.isArray(newConfig.headers)) {
+                  newConfig.headers = [
+                    ...newConfig.headers.filter(([k]: [string, string]) => k.toLowerCase() !== 'authorization'),
+                    ['Authorization', `Bearer ${newToken}`],
+                    ['X-Is-Retry', 'true']
+                  ];
+                } else {
+                  newConfig.headers = {
+                    ...newConfig.headers,
+                    'Authorization': `Bearer ${newToken}`,
+                    'X-Is-Retry': 'true'
+                  };
+                }
+              }
+
+              return await originalFetch(resource, newConfig);
+            }
+          }
+        } catch (e) {
+
+        }
+      }
+
+      return response;
+    };
+
+    try {
+      Object.defineProperty(window, 'fetch', {
+        value: customFetch,
+        configurable: true,
+        writable: true
+      });
+    } catch (e) {
+
+      try {
+        (window as any).fetch = customFetch;
+      } catch (err) {
+
+      }
+    }
+
+    return () => {
+      try {
+        Object.defineProperty(window, 'fetch', {
+          value: originalFetch,
+          configurable: true,
+          writable: true
+        });
+      } catch (e) {
+        try {
+          (window as any).fetch = originalFetch;
+        } catch (err) {
+
+        }
+      }
+    };
+  }, []);
+
+  const fetchWithRetry = async (url: string, options: any = {}, retries = 2, backoff = 300): Promise<any> => {
+    try {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        if (retries > 0 && (res.status >= 500 || res.status === 404 || res.status === 429)) {
+           const retryDelay = res.status === 429 ? backoff * 2.5 : backoff;
+           await new Promise(r => setTimeout(r, retryDelay));
+           return fetchWithRetry(url, options, retries - 1, backoff * 1.5);
+        }
+        throw new Error(`HTTP error! status: ${res.status}`);
+      }
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) {
+        if (retries > 0) {
+          await new Promise(r => setTimeout(r, backoff));
+          return fetchWithRetry(url, options, retries - 1, backoff * 1.5);
+        }
+        throw new Error(`Received HTML response instead of JSON from ${url}`);
+      }
+      return await res.json();
+    } catch (err) {
+      if (retries > 0) {
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        return fetchWithRetry(url, options, retries - 1, backoff * 1.5);
+      }
+      throw err;
+    }
+  };
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!isAuthReady) {
+        completeBoot(true);
+      }
+    }, 2000); 
+    return () => clearTimeout(timer);
+  }, [isAuthReady]);
+
+  const fetchUserProfile = async (retryCount = 0) => {
+    if (!token || isJwtExpired(token)) {
+      if (token && isJwtExpired(token)) {
+        purgeSession(false);
+      }
+      completeBoot();
+      return;
+    }
+
+    try {
+      const data = await fetchWithRetry(`/api/user/me?t=${Date.now()}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      }, 1, 300);
+
+      const userProfile = data.user || (data.email ? data : null);
+
+      if (userProfile) {
+        setUser(userProfile);
+        setBalance(Number(userProfile.points || 0));
+        setBalanceUSD(Number(userProfile.balance || 0));
+        if (userProfile.language) setLanguage(userProfile.language as Language);
+        if (userProfile.theme) {
+          const localTheme = secureStorage.getSync('perplexta_theme');
+          if (!localTheme) {
+            setThemeContext(userProfile.theme as Theme);
+          }
+        }
+        if (data.economy) setEconomySettings(data.economy);
+        completeBoot();
+      } else {
+
+        completeBoot();
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+
+      if ((errMsg.includes('401') || errMsg.includes('403')) && retryCount < 1) {
+
+        setTimeout(() => fetchUserProfile(retryCount + 1), 1500);
+        return;
+      }
+
+      if (errMsg.includes('401') || errMsg.includes('403')) {
+
+        logout(false);
+      } else {
+        completeBoot();
+      }
+    }
+  };
+
+
+  const profileFetched = useRef(false);
+  useEffect(() => {
+
+    const loggedOutToast = secureStorage.getSync('app_logged_out_toast');
+    if (loggedOutToast === '1') {
+      secureStorage.remove('app_logged_out_toast');
+      // SILENCED FOR STORE COMPLIANCE
+    }
+  }, [language]);
+
+  useEffect(() => {
+
+    if (!token) {
+      profileFetched.current = false;
+      completeBoot();
+      return;
+    }
+
+    const forceRefresh = secureStorage.getSync('app_force_refresh') === '1';
+
+    if (!profileFetched.current || forceRefresh) {
+      profileFetched.current = true;
+      secureStorage.remove('app_force_refresh');
+      fetchUserProfile();
+    }
+
+    if (socket && !socket.connected) {
+      socket.auth = { token };
+      socket.connect();
+    }
+  }, [token, socket]);
+
+  const loginWithGoogle = async () => {
+    try {
+      const currentPath = window.location.pathname + window.location.search;
+      const ref = secureStorage.getSync('app_ref') || (currentPath !== '/' ? currentPath : '/chat');
+      const lang = secureStorage.getSync('language') || 'en';
+      const currentTheme = theme || 'dark';
+
+      secureStorage.set('app_ref', ref);
+      secureStorage.remove('app_oauth_syncing');
+
+      const authSessionId = 'auth_session_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+
+      const res = await fetch(`/api/auth/google/url?lang=${lang}&theme=${currentTheme}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}&mode=popup&remember=${rememberMe}&authSessionId=${authSessionId}`);
+
+      if (!res.ok) {
+        throw new Error(`Auth URL fetch failed: ${res.status}`);
+      }
+
+      const contentType = res.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        throw new Error('Invalid server response');
+      }
+
+      const data = await res.json();
+      if (!data?.url) {
+        throw new Error('No auth URL returned');
+      }
+
+      const width = 500;
+      const height = 600;
+      const left = window.screenX + (window.outerWidth - width) / 2;
+      const top = window.screenY + (window.outerHeight - height) / 2;
+
+      const popup = window.open(data.url, 'Google Login', `width=${width},height=${height},left=${left},top=${top}`);
+
+      if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+        const redirectRes = await fetch(`/api/auth/google/url?lang=${lang}&theme=${currentTheme}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}&mode=redirect&remember=${rememberMe}&authSessionId=${authSessionId}`);
+        if (redirectRes.ok) {
+          const redirectData = await redirectRes.json();
+          if (redirectData?.url) {
+            window.location.href = redirectData.url;
+            return;
+          }
+        }
+      }
+
+      let checkCount = 0;
+      const pollInterval = setInterval(async () => {
+        checkCount++;
+        if (checkCount > 300) { 
+          clearInterval(pollInterval);
+          return;
+        }
+
+        try {
+          const pollRes = await fetch(`/api/auth/poll?authSessionId=${authSessionId}`);
+          if (pollRes.ok) {
+            const pollData = await pollRes.json();
+            if (pollData.status === 'success' && pollData.data) {
+              clearInterval(pollInterval);
+              handleAuthSuccess(pollData.data);
+              if (popup && !popup.closed) {
+                try {
+                  popup.close();
+                } catch (e) {}
+              }
+              return;
+            }
+          }
+        } catch (pollErr) {}
+
+        const storedToken = secureStorage.getSync('app_token');
+        const userDataJson = secureStorage.getSync('app_oauth_user');
+
+        if (storedToken && userDataJson) {
+          clearInterval(pollInterval);
+          try {
+            const userData = JSON.parse(userDataJson);
+            const processedUser = userData.user ? { token: userData.token, ...userData.user } : userData;
+            handleAuthSuccess(processedUser);
+            secureStorage.remove('app_oauth_user');
+            secureStorage.remove('app_oauth_trigger');
+            if (popup && !popup.closed) {
+              try {
+                popup.close();
+              } catch (e) {}
+            }
+          } catch (e) {}
+        }
+      }, 1000);
+
+    } catch (error) {
+      console.error('[Google Login Error]:', error);
+      toast.error(dir === 'rtl' ? 'تعذر بدء تسجيل الدخول باستخدام جوجل' : 'Failed to start Google sign-in');
+    }
+  };
+
+  const login = async (email: string, password: string) => {
+    try {
+      const res = await fetch(`/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, remember: rememberMe })
+      });
+
+      const contentType = res.headers.get('content-type');
+      if (contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (res.ok) {
+          setToken(data.token);
+          if (data.refreshToken) {
+            secureStorage.set('app_refresh_token', data.refreshToken);
+            setRefreshTokenState(data.refreshToken);
+          }
+          setUser(data.user);
+          secureStorage.set('app_token', data.token);
+          secureStorage.set('last_active_tool', 'chat_fast');
+          setIsAuthModalOpen(false);
+          navigate('/chat');
+          triggerAuthSuccessToast('login');
+          logUserActivity('LOGIN_SUCCESS', { email });
+
+          try {
+            trackLoginEvent(data.user.id || data.user._id || 'unknown', data.user.role || 'user', 'email');
+          } catch (e) {
+            console.error('[Analytics Error]:', e);
+          }
+
+          return { success: true };
+        } else {
+          return { success: false, error: data.error };
+        }
+      } else {
+        const text = await res.text();
+        return { 
+          success: false, 
+          error: text.includes('Rate exceeded') 
+            ? (dir === 'rtl' ? 'تم تجاوز حد الطلبات. يرجى المحاولة لاحقاً.' : 'Rate limit exceeded. Please try again later.')
+            : (dir === 'rtl' ? 'حدث خطأ في الخادم' : 'Server error occurred') 
+        };
+      }
+    } catch (error) {
+      return { success: false, error: dir === 'rtl' ? 'خطأ في الاتصال' : 'Connection error' };
+    }
+  };
+
+  const signup = async (email: string, password: string, name: string, ref?: string) => {
+    try {
+      const res = await fetch('/api/auth/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, name, ref })
+      });
+
+      const contentType = res.headers.get('content-type');
+      if (contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (res.ok) {
+          setToken(data.token);
+          if (data.refreshToken) {
+            secureStorage.set('app_refresh_token', data.refreshToken);
+            setRefreshTokenState(data.refreshToken);
+          }
+          setUser(data.user);
+          secureStorage.set('app_token', data.token);
+          secureStorage.set('last_active_tool', 'chat_fast');
+          setIsAuthModalOpen(false);
+          navigate('/chat');
+          triggerAuthSuccessToast('signup');
+          logUserActivity('SIGNUP_SUCCESS', { email });
+
+          try {
+            trackSignUpEvent(data.user.id || data.user._id || 'unknown', 'email');
+          } catch (e) {
+            console.error('[Analytics Error]:', e);
+          }
+
+          return { success: true };
+        } else {
+          return { success: false, error: data.error };
+        }
+      } else {
+        const text = await res.text();
+        return { 
+          success: false, 
+          error: text.includes('Rate exceeded') 
+            ? (dir === 'rtl' ? 'تم تجاوز حد الطلبات. يرجى المحاولة لاحقاً.' : 'Rate limit exceeded. Please try again later.')
+            : (dir === 'rtl' ? 'حدث خطأ في الخادم' : 'Server error occurred') 
+        };
+      }
+    } catch (error) {
+      return { success: false, error: dir === 'rtl' ? 'خطأ في الاتصال' : 'Connection error' };
+    }
+  };
+
+  const purgeSession = useCallback((forceRedirect = true) => {
+    if (socket) {
+      try {
+        socket.disconnect();
+      } catch (e) {}
+    }
+
+    userRef.current = null;
+    profileFetched.current = false;
+    isSyncingAuth.current = false;
+
+    setIsAuthModalOpen(false);
+    setSocket(null);
+    setToken(null);
+    setRefreshTokenState(null);
+    setUser(null);
+    setBalance(0);
+    setBalanceUSD(0);
+    setNotifications([]);
+    setMilestoneData(null);
+
+    SessionPurge.purgeAll({
+      queryClient,
+      preserveTheme: true,
+      preserveLanguage: true,
+    });
+
+    if (forceRedirect) {
+      try {
+        secureStorage.set('app_logged_out_toast', '1');
+      } catch {}
+      // Perform clean hard reload / redirect to reset all background hooks and memory state
+      window.location.replace('/');
+    } else {
+      secureStorage.remove('app_loader_type');
+    }
+  }, [socket, queryClient]);
+
+  const logout = async (forceRedirect = true) => {
+    const hasActiveSession = !!(token || userRef.current || user);
+    if (hasActiveSession) {
+      try {
+        logUserActivity('LOGOUT');
+      } catch {}
+    }
+
+    const storedToken = token || secureStorage.getSync('app_token');
+    const storedRefreshToken = secureStorage.getSync('app_refresh_token');
+
+    // Notify server to revoke all sessions and blacklist tokens
+    if ((storedToken && !isJwtExpired(storedToken)) || storedRefreshToken) {
+      try {
+        const logoutPromise = fetch(`${API_BASE_URL}/api/auth/logout`, {
+          method: 'POST',
+          headers: { 
+            ...(storedToken ? { 'Authorization': `Bearer ${storedToken}` } : {}),
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ refreshToken: storedRefreshToken, token: storedToken }),
+          keepalive: true
+        });
+
+        // Give server request a quick window to finish or dispatch without freezing UI
+        await Promise.race([
+          logoutPromise,
+          new Promise(resolve => setTimeout(resolve, 350))
+        ]).catch(() => {});
+      } catch (e) {}
+    }
+
+    purgeSession(forceRedirect);
+  };
+
+  useEffect(() => {
+    if (!user || !token) {
+      setShowInactivityWarning(false);
+      return;
+    }
+
+    secureStorage.set('perplexta_last_activity', Date.now().toString());
+
+    let lastWriteTime = Date.now();
+    const INACTIVITY_LIMIT = 2 * 60 * 60 * 1000;
+    const WARNING_BEFORE_SECONDS = 60;
+    const WARNING_THRESHOLD = INACTIVITY_LIMIT - WARNING_BEFORE_SECONDS * 1000;
+
+    const updateLastActivity = () => {
+      const now = Date.now();
+      
+      if (showWarningRef.current) {
+        secureStorage.set('perplexta_last_activity', now.toString());
+        lastWriteTime = now;
+        setShowInactivityWarning(false);
+        return;
+      }
+
+      if (now - lastWriteTime > 15000) {
+        secureStorage.set('perplexta_last_activity', now.toString());
+        lastWriteTime = now;
+      }
+    };
+
+    const events = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'click'];
+    events.forEach(event => {
+      window.addEventListener(event, updateLastActivity, { passive: true });
+    });
+
+    const interval = setInterval(() => {
+      const lastActivityStr = secureStorage.getSync('perplexta_last_activity');
+      if (!lastActivityStr) {
+        secureStorage.set('perplexta_last_activity', Date.now().toString());
+        return;
+      }
+
+      const lastActivity = parseInt(lastActivityStr, 10);
+      const now = Date.now();
+      const diff = now - lastActivity;
+
+      if (!isNaN(lastActivity)) {
+        if (diff >= INACTIVITY_LIMIT) {
+          clearInterval(interval);
+          setShowInactivityWarning(false);
+          toast.warning(
+            language === 'ar'
+              ? 'تم تسجيل الخروج تلقائياً بسبب عدم النشاط لمدة ساعتين لحماية حسابك.'
+              : 'Session expired due to 2 hours of inactivity.'
+          );
+          logout(true);
+        } else if (diff >= WARNING_THRESHOLD) {
+          setShowInactivityWarning(true);
+          const remainingSeconds = Math.max(0, Math.ceil((INACTIVITY_LIMIT - diff) / 1000));
+          setInactivityCountdown(remainingSeconds);
+        } else {
+          if (showWarningRef.current) {
+            setShowInactivityWarning(false);
+          }
+        }
+      }
+    }, 2500);
+
+    return () => {
+      events.forEach(event => {
+        window.removeEventListener(event, updateLastActivity);
+      });
+      clearInterval(interval);
+    };
+  }, [user, token, language, logout]);
+
+  const [siteSettings, setSiteSettings] = useState<SiteSettings>(() => {
+    let saved = null;
+    try {
+      saved = secureStorage.getSync('site_settings');
+    } catch (e) {}
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch (e) {
+
+      }
+    }
+    return {
+      siteName: 'Perplexta Platform',
+      siteNameAr: 'بيربليكستا',
+      seoSiteNameEn: '',
+      seoSiteNameAr: '',
+      siteDescription: '',
+      siteDescriptionAr: '',
+      logoBase64: null,
+      logoLightBase64: null,
+      faviconBase64: null,
+      seoDescriptionEn: '',
+      seoDescriptionAr: '',
+      keywordsEn: '',
+      keywordsAr: '',
+      googleAnalyticsId: '',
+      googleSiteVerification: '',
+      seoImageUrl: null
+    };
+  });
+
+  useEffect(() => {
+    secureStorage.set('site_settings', JSON.stringify(siteSettings));
+  }, [siteSettings]);
+
+
+
+  const [plans, setPlans] = useState<any[]>(() => {
+    try {
+      const cached = secureStorage.getSync('app_plans_cache');
+      return cached ? JSON.parse(cached) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [plansLoaded, setPlansLoaded] = useState<boolean>(false);
+  const [notifications, setNotifications] = useState<any[]>([]);
+  const [milestoneData, setMilestoneData] = useState<any>(null);
+  const unreadCount = notifications.filter(n => !n.is_read).length;
+
+  const t = (key: string, replacements?: Record<string, string | number>) => {
+    let str = (translations[language] as any)[key] || key;
+
+    if (key === 'appName') {
+      str = language === 'ar' 
+        ? (siteSettings.siteNameAr || '') 
+        : (siteSettings.siteName || '');
+    }
+
+    if (replacements) {
+      Object.entries(replacements).forEach(([k, v]) => {
+        str = str.replace(`{${k}}`, v.toString());
+      });
+    }
+    return str;
+  };
+
+  useEffect(() => {
+    if (!token) {
+      if (socket) {
+        socket.disconnect();
+        setSocket(null);
+      }
+      return;
+    }
+
+    const isExpired = (() => {
+      try {
+        const parts = token.split('.');
+        if (parts.length < 2) return true;
+        const decodedPayload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        return decodedPayload.exp ? (decodedPayload.exp * 1000 < Date.now() + 5000) : false;
+      } catch (e) {
+        return true;
+      }
+    })();
+
+    if (isExpired) {
+
+      silentRefreshToken().catch(err => {
+
+      });
+      return;
+    }
+
+    const socketEndpoint = SOCKET_URL || window.location.origin;
+    const socketOptions: any = { 
+      transports: usePollingFallback ? ['polling'] : ['websocket', 'polling'], 
+      autoConnect: true,
+      auth: { token }
+    };
+
+    const newSocket = io(socketEndpoint, socketOptions);
+    setSocket(newSocket);
+
+    newSocket.on('connect_error', async (err: any) => {
+
+      if (!usePollingFallback) {
+
+        try {
+          secureStorage.set('socket_polling_fallback', 'true');
+        } catch (e) {
+
+        }
+        setUsePollingFallback(true);
+        return;
+      }
+
+      if (err.message && (err.message.includes('Authentication error') || err.message.includes('Invalid token') || err.message.includes('Token missing'))) {
+
+        const refreshedToken = await silentRefreshToken();
+        if (refreshedToken) {
+
+          newSocket.auth = { token: refreshedToken };
+          newSocket.connect();
+        } else {
+
+          logout(false);
+        }
+      }
+    });
+
+    newSocket.on('connect', () => {
+      if (userRef.current?.id) {
+        newSocket.emit('register_user', userRef.current.id);
+      }
+    });
+
+    const playNotificationChime = () => {
+      try {
+        const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+        if (!AudioContext) return;
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.12);
+        gain.gain.setValueAtTime(0.05, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.22);
+      } catch (e) {}
+    };
+
+    const handleIncomingNotification = (notif: any) => {
+      if (!notif) return;
+      
+      setNotifications(prev => {
+        if (prev.some(n => n.id === notif.id)) return prev;
+        return [notif, ...prev];
+      });
+
+      playNotificationChime();
+
+      try {
+        const title = language === 'ar' ? (notif.title_ar || notif.title_en) : (notif.title_en || notif.title_ar);
+        const msg = language === 'ar' ? (notif.message_ar || notif.message_en) : (notif.message_en || notif.message_ar);
+
+        if (title || msg) {
+          toast.info(title || (language === 'ar' ? 'تنبيه جديد' : 'New Alert'), {
+            description: msg,
+            duration: 4000
+          });
+        }
+
+        if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+          new Notification(title || 'Alert', {
+            body: msg || '',
+            icon: siteSettings?.faviconBase64 ? resolveImageUrl(siteSettings.faviconBase64, 'general') : undefined
+          });
+        }
+      } catch (err) {
+      }
+    };
+
+    newSocket.on('new_notification', handleIncomingNotification);
+    newSocket.on('notification', handleIncomingNotification);
+    newSocket.on('realtime_alert', handleIncomingNotification);
+    newSocket.on('security_alert', handleIncomingNotification);
+    newSocket.on('wallet_alert', handleIncomingNotification);
+    newSocket.on('ad_direct_message', (msg: any) => {
+      if (userRef.current?.id && msg && Number(msg.sender_id) !== Number(userRef.current.id)) {
+        const notif = {
+          id: Date.now(),
+          title_ar: 'رسالة جديدة في صندوق المحادثات',
+          title_en: 'New Message in Messenger',
+          message_ar: msg.message ? `تلقيت رسالة جديدة: "${msg.message.slice(0, 50)}..."` : 'تلقيت رسالة جديدة حول الإعلان',
+          message_en: msg.message ? `New message received: "${msg.message.slice(0, 50)}..."` : 'New message received regarding ad',
+          is_read: false,
+          created_at: new Date().toISOString()
+        };
+        handleIncomingNotification(notif);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new Event('bulletin-inquiry-updated'));
+        }
+      }
+    });
+
+    newSocket.on('quota_milestone', (data: any) => {
+      setMilestoneData(data);
+    });
+
+    const handleUserProfileOrWalletChange = () => {
+      refreshUser();
+    };
+
+    newSocket.on('user_profile_updated', handleUserProfileOrWalletChange);
+    newSocket.on('balance_update', handleUserProfileOrWalletChange);
+    newSocket.on('wallet_updated', handleUserProfileOrWalletChange);
+    newSocket.on('subscription_updated', handleUserProfileOrWalletChange);
+    newSocket.on('subscription_canceled', handleUserProfileOrWalletChange);
+    newSocket.on('quota_reset', handleUserProfileOrWalletChange);
+
+    newSocket.on('credit_usage_updated', (data: any) => {
+      setUser(prev => {
+        if (!prev || !prev.subscription) return prev;
+        const cycle = data.cycle_credits ?? prev.subscription.cycle_credits ?? 0;
+        const used = data.used_credits ?? prev.subscription.used_credits ?? 0;
+        const rem = data.remaining_credits ?? Math.max(0, cycle - used);
+        const pct = cycle > 0 ? Math.min(100, Math.round((used / cycle) * 100)) : 0;
+        return {
+          ...prev,
+          subscription: {
+            ...prev.subscription,
+            cycle_credits: cycle,
+            used_credits: used,
+            remaining_credits: rem,
+            usage_percentage: pct
+          }
+        };
+      });
+    });
+
+    newSocket.on('usage_update', (data: { toolId: string; usageCount: number }) => {
+      setUser(prev => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          usageStats: {
+            ...prev.usageStats,
+            [data.toolId]: data.usageCount
+          }
+        };
+      });
+    });
+
+    return () => {
+      newSocket.disconnect();
+    };
+  }, [token, language, usePollingFallback]);
+
+  // Session Expiration Notification Helper
+  useEffect(() => {
+    if (!token) return;
+
+    try {
+      const parts = token.split('.');
+      if (parts.length < 2) return;
+      const decodedPayload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+      const exp = decodedPayload.exp;
+      if (!exp) return;
+
+      const expiryTime = exp * 1000;
+      const warningTime = expiryTime - (5 * 60 * 1000); // 5 minutes before
+      const timeToWarning = warningTime - Date.now();
+
+      if (timeToWarning > 0) {
+        const timerId = setTimeout(() => {
+          toast.warning(t('sessionExpiringTitle'), {
+            description: t('sessionExpiringMessage'),
+            duration: 15000,
+            action: {
+              label: t('refreshNow'),
+              onClick: () => window.location.reload()
+            }
+          });
+        }, timeToWarning);
+
+        return () => clearTimeout(timerId);
+      }
+    } catch (e) {
+      console.warn('[AppContext] Failed to schedule session expiration warning:', e);
+    }
+  }, [token, language, t]);
+
+  const markAsRead = async (id: number) => {
+    if (!token || isJwtExpired(token)) return;
+    try {
+      const res = await fetch(`/api/notifications/${id}/read`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setNotifications(prev => prev.map(n => n.id === id ? { ...n, is_read: true } : n));
+      }
+    } catch (error) {
+
+    }
+  };
+
+  const markAllAsRead = async () => {
+    if (!token || isJwtExpired(token)) return;
+    try {
+      const res = await fetch('/api/notifications/read-all', {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setNotifications(prev => prev.map(n => ({ ...n, is_read: true })));
+      }
+    } catch (error) {
+
+    }
+  };
+
+  const deleteNotification = async (id: number) => {
+    if (!token || isJwtExpired(token)) return;
+    try {
+      const res = await fetch(`/api/notifications/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setNotifications(prev => prev.filter(n => n.id !== id));
+      }
+    } catch (error) {
+
+    }
+  };
+
+  const clearAllNotifications = async () => {
+    if (!token || isJwtExpired(token)) return;
+    try {
+      const res = await fetch('/api/notifications/all', {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setNotifications([]);
+      }
+    } catch (error) {
+
+    }
+  };
+
+  useEffect(() => {
+    if (!token || isJwtExpired(token)) return;
+
+    let isMounted = true;
+    let timeoutId: any = null;
+    let currentDelay = 30000;
+    let isFetching = false;
+
+    const scheduleNext = (delay: number) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (isMounted) {
+        timeoutId = setTimeout(() => {
+          fetchNotificationsSecure();
+        }, delay);
+      }
+    };
+
+    const fetchNotificationsSecure = async () => {
+      if (!isMounted || !token || isJwtExpired(token)) return;
+      if (isFetching) return;
+
+      if (document.visibilityState === 'hidden') {
+        scheduleNext(30000);
+        return;
+      }
+
+      isFetching = true;
+      try {
+        const res = await fetch('/api/notifications', {
+          headers: { 
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json',
+            'Cache-Control': 'no-cache'
+          }
+        });
+        if (!isMounted) return;
+
+        if (res.ok) {
+          const contentType = res.headers.get('content-type');
+          if (contentType && contentType.includes('application/json')) {
+            const data = await res.json();
+            if (isMounted) {
+              setNotifications(data);
+              currentDelay = 30000; 
+            }
+          } else {
+            const text = await res.text();
+
+          }
+        } else if (res.status === 401 || res.status === 403) {
+
+          logout(false);
+          return;
+        } else if (res.status === 429) {
+          currentDelay = Math.min(currentDelay * 2, 300000); 
+
+        } else {
+
+        }
+      } catch (error) {
+        if (!isMounted) return;
+        if (error instanceof Error && error.message.includes('Failed to fetch')) {
+
+        } else {
+
+        }
+        currentDelay = Math.min(currentDelay * 1.5, 300000);
+      } finally {
+        isFetching = false;
+        if (isMounted) {
+          scheduleNext(currentDelay);
+        }
+      }
+    };
+
+    scheduleNext(5000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && isMounted) {
+        fetchNotificationsSecure();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      isMounted = false;
+      if (timeoutId) clearTimeout(timeoutId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [token]);
+
+  const refreshUser = async () => {
+    if (!token || isJwtExpired(token)) {
+      if (token && isJwtExpired(token)) {
+        purgeSession(false);
+      }
+      return null;
+    }
+    try {
+      const res = await fetch(`/api/user/me`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const userProfile = data.user || (data.email ? data : null);
+        if (userProfile) {
+          setUser(userProfile);
+          setBalance(Number(userProfile.points || 0));
+          setBalanceUSD(Number(userProfile.balance || 0));
+          if (data.economy) {
+            setEconomySettings(data.economy);
+          }
+          return userProfile;
+        }
+      } else if (res.status === 401 || res.status === 403) {
+
+        logout(false);
+      }
+    } catch (error) {
+
+    }
+    return null;
+  };
+
+  const payWithBalance = async (planId: string, billingCycle: 'monthly' | 'annual' | 'daily') => {
+    if (!token) {
+      setIsAuthModalOpen(true);
+      return { success: false, error: 'Auth required' };
+    }
+    try {
+      const res = await fetch('/api/subscriptions/pay-with-balance', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ planId, billingCycle })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        await refreshUser();
+
+        if (typeof window !== 'undefined' && (window as any).gtag) {
+          (window as any).gtag('event', 'purchase', {
+            transaction_id: `bal_${Date.now()}`,
+            value: billingCycle === 'annual' ? 99.0 : (billingCycle === 'daily' ? 4.9 : 9.9), 
+            currency: 'USD',
+            items: [{ item_id: planId, item_name: `Plan_${planId}`, item_category: 'subscription' }],
+            method: 'balance'
+          });
+
+        }
+        return { success: true, message: data.message };
+      }
+      return { success: false, error: data.error };
+    } catch (error) {
+      return { success: false, error: 'Network error' };
+    }
+  };
+
+  const stripeCheckout = async (planId: string, billingCycle: 'monthly' | 'annual' | 'daily') => {
+    if (!token) {
+      setIsAuthModalOpen(true);
+      return { error: 'Auth required' };
+    }
+    try {
+      const res = await fetch('/api/payments/stripe-checkout', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ planId, billingCycle })
+      });
+      const data = await res.json();
+      if (res.ok && data.url) {
+
+        if (typeof window !== 'undefined' && (window as any).gtag) {
+          (window as any).gtag('event', 'begin_checkout', {
+            value: billingCycle === 'annual' ? 99.0 : (billingCycle === 'daily' ? 4.9 : 9.9),
+            currency: 'USD',
+            items: [{ item_id: planId, item_name: `Plan_${planId}`, item_category: 'subscription' }]
+          });
+
+        }
+        window.location.href = data.url;
+        return { url: data.url };
+      }
+      return { error: data.error || 'Stripe error' };
+    } catch (error) {
+      return { error: 'Network error' };
+    }
+  };
+
+  useEffect(() => {
+    const fetchSettingsAndPlans = async () => {
+      const options = token ? { headers: { 'Authorization': `Bearer ${token}` } } : {};
+
+      const fetchSettings = async () => {
+        try {
+          const settingsData = await fetchWithRetry('/api/system/settings', options, 2, 400);
+          if (!settingsData || typeof settingsData !== 'object') return;
+          let parsedFontConfig: FontLoadingConfig | null = null;
+          let parsedAr: FontLanguageConfig | null = null;
+          let parsedEn: FontLanguageConfig | null = null;
+          try {
+            if (settingsData.font_loading_config) {
+              parsedFontConfig = typeof settingsData.font_loading_config === 'string'
+                ? JSON.parse(settingsData.font_loading_config)
+                : settingsData.font_loading_config;
+            }
+            if (settingsData.font_config_ar) {
+              parsedAr = typeof settingsData.font_config_ar === 'string'
+                ? JSON.parse(settingsData.font_config_ar)
+                : settingsData.font_config_ar;
+            }
+            if (settingsData.font_config_en) {
+              parsedEn = typeof settingsData.font_config_en === 'string'
+                ? JSON.parse(settingsData.font_config_en)
+                : settingsData.font_config_en;
+            }
+          } catch (err) {
+            console.warn('[AppContext] Failed to parse font configs:', err);
+          }
+
+          setSiteSettings({
+            siteName: settingsData.site_name_en || '',
+            siteNameAr: settingsData.site_name_ar || '',
+            siteDescription: settingsData.site_description_en || '',
+            siteDescriptionAr: settingsData.site_description_ar || '',
+            seoSiteNameEn: settingsData.seo_site_name_en || '',
+            seoSiteNameAr: settingsData.seo_site_name_ar || '',
+            seoDescriptionEn: settingsData.seo_description_en || '',
+            seoDescriptionAr: settingsData.seo_description_ar || '',
+            keywordsEn: settingsData.keywords_en || '',
+            keywordsAr: settingsData.keywords_ar || '',
+            googleAnalyticsId: settingsData.google_analytics_id || '',
+            googleSiteVerification: settingsData.google_site_verification || '',
+            logoBase64: settingsData.logo_url || null,
+            logoLightBase64: settingsData.logo_light_url || null,
+            faviconBase64: settingsData.favicon_url || null,
+            seoImageUrl: settingsData.seo_image_url || null,
+            blocked_paths: settingsData.blocked_paths || '',
+            fontLoadingConfig: parsedFontConfig,
+            fontConfigAr: parsedAr,
+            fontConfigEn: parsedEn
+          });
+        } catch (err) {
+          console.error('[AppContext] Settings fetch error:', err);
+        }
+      };
+
+      const fetchEconomy = async () => {
+        try {
+          const ecoData = await fetchWithRetry('/api/system/economy', options, 2, 400);
+          if (ecoData && typeof ecoData === 'object') {
+            setEconomySettings(ecoData);
+            try {
+              secureStorage.set('app_economy_settings', JSON.stringify(ecoData));
+            } catch {}
+          }
+        } catch (ecoError: any) {
+          console.warn('[AppContext] Economy fetch notice (using cache/defaults):', ecoError?.message || ecoError);
+        }
+      };
+
+      const fetchPlans = async () => {
+        try {
+          const plansData = await fetchWithRetry('/api/plans', options, 2, 500);
+          const formattedPlans = (plansData || []).map((p: any) => {
+            let features = [];
+            let limits = {};
+
+            try {
+              features = Array.isArray(p.features) ? p.features : (typeof p.features === 'string' ? JSON.parse(p.features || '[]') : []);
+            } catch (e) {
+
+            }
+
+            try {
+              limits = typeof p.limits === 'object' && p.limits !== null ? p.limits : (typeof p.limits === 'string' ? JSON.parse(p.limits || '{}') : {});
+            } catch (e) {
+
+            }
+
+            return {
+              id: p.id.toString(),
+              nameEn: p.name_en || '',
+              nameAr: p.name_ar || '',
+              descEn: p.desc_en || '',
+              descAr: p.desc_ar || '',
+              badge: p.badge || 'none',
+              discount: p.discount || 0,
+              isActive: p.is_active ?? true,
+              isVisible: p.is_visible ?? true,
+              hideTools: Boolean(p.hide_tools === true || p.hide_tools === 'true'),
+              monthlyPrice: parseFloat(p.monthly_price || 0),
+              annualPrice: parseFloat(p.annual_price || 0),
+              isMonthlyEnabled: p.is_monthly_enabled !== false,
+              isAnnualEnabled: p.is_annual_enabled !== false,
+              isDailyEnabled: Boolean(p.is_daily_enabled),
+              dailyPrice: parseFloat(p.daily_price || 0),
+              dailyDays: parseInt(p.daily_days || 7, 10),
+              color: p.color || '#334155',
+              planType: p.plan_type || 'user',
+              features,
+              limits
+            };
+          });
+          setPlans(formattedPlans);
+          try {
+            secureStorage.set('app_plans_cache', JSON.stringify(formattedPlans));
+          } catch {}
+        } catch (error) {
+          console.error('[AppContext] Plans fetch error:', error);
+        } finally {
+          setPlansLoaded(true);
+        }
+      };
+
+      await Promise.allSettled([fetchSettings(), fetchEconomy(), fetchPlans()]);
+    };
+    fetchSettingsAndPlans();
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dir = dir;
+    document.documentElement.lang = language;
+    secureStorage.set('language', language);
+
+    applyLanguageFont(language, siteSettings.fontLoadingConfig);
+    ThemeSync.apply(theme);
+  }, [language, theme, dir, siteSettings.fontLoadingConfig]);
+
+  useEffect(() => {
+    if (languageTransitioning) {
+      document.documentElement.classList.add('lang-transitioning');
+    } else {
+      const timer = setTimeout(() => {
+        document.documentElement.classList.remove('lang-transitioning');
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [languageTransitioning]);
+
+  useEffect(() => {
+    const iconSource = siteSettings.faviconBase64 || siteSettings.logoBase64;
+    if (iconSource) {
+      updateDocumentHeadIcons(resolveImageUrl(iconSource, 'general'));
+    } else {
+      updateDocumentHeadIcons(null);
+    }
+  }, [siteSettings.faviconBase64, siteSettings.logoBase64]);
+
+  return (
+    <AppContext.Provider value={{ 
+      language, setLanguage: handleLanguageChange, 
+      theme, setTheme: handleThemeChange, resolvedTheme, themeTransitioning, 
+      languageTransitioning,
+      dir, t, 
+      isSidebarOpen, setIsSidebarOpen,
+      user, setUser, isAuthReady,
+      token, balance,
+      login, signup,
+      loginWithGoogle, logout, purgeSession,
+      isAuthModalOpen, setIsAuthModalOpen,
+      plans, setPlans, plansLoaded,
+      siteSettings, setSiteSettings,
+      economySettings, setEconomySettings,
+      payWithBalance, stripeCheckout, refreshUser, balanceUSD,
+      notifications, setNotifications, unreadCount, markAsRead, markAllAsRead,
+      deleteNotification,
+      clearAllNotifications,
+      socket,
+      milestoneData,
+      setMilestoneData,
+      isMobile,
+      isIOS,
+      isStandaloneWebview: standaloneWebviewState.isStandaloneWebview,
+      isWebview: standaloneWebviewState.isWebview,
+      isPwaStandalone: standaloneWebviewState.isStandalone,
+      isStandardBrowser: standaloneWebviewState.isStandardBrowser,
+      rememberMe,
+      setRememberMe,
+      isOperationPending,
+      setIsOperationPending,
+      memoryNotification,
+      triggerMemoryNotification,
+      closeMemoryNotification,
+      upgradePromptState,
+      setUpgradePromptState,
+      triggerUpgradePrompt,
+      closeUpgradePrompt,
+      showInactivityWarning,
+      setShowInactivityWarning,
+      inactivityCountdown,
+      setInactivityCountdown,
+      extendSession,
+      logUserActivity
+    }}>
+      {children}
+    </AppContext.Provider>
+  );
+};
+
+export const useAppContext = () => {
+  const context = useContext(AppContext);
+  if (!context) {
+    throw new Error('useAppContext must be used within an AppProvider');
+  }
+  return context;
+};
+
+export const useApp = useAppContext;

@@ -1,0 +1,1071 @@
+import crypto from "crypto";
+import { pool, ledgerPool, externalPool, securityPool, mediaPool, createInternalPool, isMediaPoolDistinct } from "../index.js";
+import { ensureColumnsBulk } from "./helpers.js";
+import { decrypt } from "../../utils/crypto.js";
+import { getIo } from "./maintenance.js";
+import { CORE_INDEXES } from "./core.schema.js";
+import { LEDGER_INDEXES } from "./ledger.schema.js";
+import { EXTERNAL_INDEXES } from "./external.schema.js";
+import { SECURITY_INDEXES } from "./security.schema.js";
+import { MEDIA_INDEXES } from "./media.schema.js";
+
+function safelyDecryptConnectionString(encrypted: string): string {
+  try {
+    return decrypt(encrypted);
+  } catch {
+    return "";
+  }
+}
+
+export async function queryColumns(p: any, schemaName = "public"): Promise<Record<string, Set<string>>> {
+  try {
+    const res = await p.query(`
+      SELECT table_name, column_name 
+      FROM information_schema.columns 
+      WHERE table_schema = $1
+    `, [schemaName]);
+    const tables: Record<string, Set<string>> = {};
+    for (const row of res.rows) {
+      if (!tables[row.table_name]) {
+        tables[row.table_name] = new Set();
+      }
+      tables[row.table_name].add(row.column_name);
+    }
+    return tables;
+  } catch (error) {
+    throw new Error(`Failed to query information_schema: ${error instanceof Error ? error.message : "Unknown error"}`);
+  }
+}
+
+
+
+
+
+let isMonitoring = false;
+
+export async function monitorDatabases() {
+  if (isMonitoring) {
+    console.warn('[Monitor] Database monitoring already in progress, skipping...');
+    return;
+  }
+  isMonitoring = true;
+  try {
+    const registries = await pool.query('SELECT * FROM db_connections_registry');
+    for (const reg of registries.rows) {
+      let isAlive = false;
+      let connectionString = '';
+      if (reg.connection_string) {
+        try {
+          connectionString = safelyDecryptConnectionString(reg.connection_string);
+        } catch {
+          console.warn(`[Monitor] Skipping database ${reg.id} - decryption failed`);
+        }
+      }
+
+      if (!connectionString || !connectionString.startsWith('postgres')) {
+        if (reg.id === 'core') connectionString = process.env.DATABASE_URL || '';
+        else if (reg.id === 'ledger') connectionString = process.env.LEDGER_DATABASE_URL || process.env.DATABASE_URL || '';
+        else if (reg.id === 'external') connectionString = process.env.EXTERNAL_DATABASE_URL || process.env.DATABASE_URL || '';
+        else if (reg.id === 'security') connectionString = process.env.SECURITY_DATABASE_URL || process.env.DATABASE_URL || '';
+        else if (reg.id === 'media') connectionString = process.env.MEDIA_DATABASE_URL || process.env.DATABASE_URL || '';
+      }
+
+      // If core is remote and this database URL points to localhost/127.0.0.1, fallback to Core DB
+      const coreEnv = process.env.DATABASE_URL || '';
+      const isCoreRemote = coreEnv && !coreEnv.includes('localhost') && !coreEnv.includes('127.0.0.1');
+      if (isCoreRemote && (connectionString.includes('localhost') || connectionString.includes('127.0.0.1'))) {
+        connectionString = coreEnv;
+      }
+
+      if (!connectionString.startsWith('postgres')) continue;
+
+      const TestPool = createInternalPool(connectionString);
+      try {
+        await TestPool.query('SELECT 1');
+        isAlive = true;
+      } catch (e) {
+        isAlive = false;
+      } finally {
+        await TestPool.end();
+      }
+
+      await pool.query(
+        `UPDATE db_connections_registry SET status = $1, last_checked_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [isAlive ? 'healthy' : 'down', reg.id]
+      );
+      const io = getIo();
+      if (!isAlive && io) io.emit('db_alert', { provider: reg.provider, status: 'down' });
+    }
+  } catch (error) {
+    console.error('[Monitor] Database monitoring failed:', error instanceof Error ? error.message : 'Unknown error');
+  } finally {
+    isMonitoring = false;
+  }
+}
+
+export async function migrateMediaAssetsData() {
+  if (!isMediaPoolDistinct()) {
+    console.log('[Media Migration] Core and Media share the same database pool. Verified: no cross-database transfer required.');
+    return;
+  }
+  const targetMediaPool = mediaPool;
+
+  console.log('[Media Migration] Detected distinct Core and Media databases. Initiating high-precision data transfer verification...');
+  try {
+    const coreTableCheck = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_name = 'media_assets'
+      )
+    `);
+    if (coreTableCheck.rows[0].exists) {
+      const coreAssets = await pool.query('SELECT * FROM media_assets');
+      if (coreAssets.rows.length > 0) {
+        console.log(`[Media Migration] Found ${coreAssets.rows.length} media_assets in Core DB. Transferring to Media DB...`);
+        let migratedCount = 0;
+        let updatedBinaryCount = 0;
+        
+        for (const row of coreAssets.rows) {
+          try {
+            const existingInMedia = await targetMediaPool.query(
+              'SELECT id, file_data FROM media_assets WHERE id = $1 OR stored_path = $2 OR sha256_hash = $3 LIMIT 1',
+              [row.id, row.stored_path, row.sha256_hash]
+            );
+
+            if (existingInMedia.rows.length > 0) {
+              const exRow = existingInMedia.rows[0];
+              if (!exRow.file_data && row.file_data) {
+                await targetMediaPool.query(
+                  'UPDATE media_assets SET file_data = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+                  [row.file_data, exRow.id]
+                );
+                updatedBinaryCount++;
+              }
+            } else {
+              await targetMediaPool.query(`
+                INSERT INTO media_assets (
+                  id, stored_path, original_filename, context, format, width, height, size_bytes,
+                  sha256_hash, is_public, user_id, metadata, created_at, updated_at, file_data
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                ON CONFLICT (id) DO UPDATE SET
+                  file_data = COALESCE(EXCLUDED.file_data, media_assets.file_data),
+                  updated_at = CURRENT_TIMESTAMP
+              `, [
+                row.id, row.stored_path, row.original_filename, row.context || 'general',
+                row.format || 'webp', row.width || 0, row.height || 0, row.size_bytes || 0,
+                row.sha256_hash, row.is_public ?? false, row.user_id || null,
+                typeof row.metadata === 'object' ? JSON.stringify(row.metadata) : (row.metadata || '{}'),
+                row.created_at || new Date(), row.updated_at || new Date(), row.file_data || null
+              ]);
+              migratedCount++;
+            }
+          } catch (rowErr: any) {
+            console.warn(`[Media Migration] Row transfer notice for ${row.stored_path}:`, rowErr.message);
+          }
+        }
+        console.log(`[Media Migration] Media assets transfer complete. Inserted: ${migratedCount}, Updated binary: ${updatedBinaryCount}.`);
+      }
+    }
+
+    // Also migrate any eligible media stored in user_files that is not yet in media_assets
+    try {
+      const userFilesMediaCheck = await pool.query(`
+        SELECT id, user_id, file_name, file_url, file_size, mime_type, file_type, metadata, file_data, created_at
+        FROM user_files
+        WHERE mime_type LIKE 'image/%' OR mime_type LIKE 'video/%' OR mime_type LIKE 'audio/%' OR mime_type = 'application/pdf'
+      `);
+
+      if (userFilesMediaCheck.rows.length > 0) {
+        let userFilesMigrated = 0;
+        for (const uFile of userFilesMediaCheck.rows) {
+          const storedPath = uFile.file_url?.startsWith('uploads/') ? uFile.file_url : (uFile.file_url?.startsWith('/uploads/') ? uFile.file_url.substring(1) : `uploads/${uFile.file_url}`);
+          const shaHash = uFile.file_data ? crypto.createHash('sha256').update(uFile.file_data).digest('hex') : crypto.createHash('sha256').update(storedPath).digest('hex');
+          
+          const exists = await targetMediaPool.query(
+            'SELECT id, file_data FROM media_assets WHERE stored_path = $1 OR sha256_hash = $2 LIMIT 1',
+            [storedPath, shaHash]
+          );
+
+          if (exists.rows.length === 0) {
+            let mContext = 'general';
+            if (uFile.mime_type?.startsWith('image/')) mContext = 'image';
+            else if (uFile.mime_type?.startsWith('video/')) mContext = 'video';
+            else if (uFile.mime_type?.startsWith('audio/')) mContext = 'audio';
+            else if (uFile.mime_type === 'application/pdf') mContext = 'document';
+
+            const integrityAssetId = crypto.randomUUID();
+            await targetMediaPool.query(`
+              INSERT INTO media_assets (
+                id, stored_path, original_filename, context, format, width, height, size_bytes,
+                sha256_hash, is_public, user_id, metadata, file_data, created_at
+              ) VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, true, $8, $9, $10, $11)
+              ON CONFLICT (stored_path) DO NOTHING
+            `, [
+              integrityAssetId, storedPath, uFile.file_name || 'media', mContext, uFile.file_type || 'general',
+              uFile.file_size || 0, shaHash, uFile.user_id || null,
+              typeof uFile.metadata === 'object' ? JSON.stringify(uFile.metadata) : (uFile.metadata || '{}'),
+              uFile.file_data || null, uFile.created_at || new Date()
+            ]);
+            userFilesMigrated++;
+          } else if (!exists.rows[0].file_data && uFile.file_data) {
+            await targetMediaPool.query(
+              'UPDATE media_assets SET file_data = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+              [uFile.file_data, exists.rows[0].id]
+            );
+          }
+        }
+        if (userFilesMigrated > 0) {
+          console.log(`[Media Migration] Transferred ${userFilesMigrated} files from user_files to media_assets in Media DB.`);
+        }
+      }
+    } catch (uErr: any) {
+      console.warn('[Media Migration] user_files media scan notice:', uErr.message);
+    }
+
+    const mediaCountCheck = await targetMediaPool.query('SELECT COUNT(*) FROM media_assets');
+    const finalMediaCount = parseInt(mediaCountCheck.rows[0].count, 10);
+    console.log(`[Media Migration] Sovereign media verification complete. Total media assets verified in Media DB: ${finalMediaCount}.`);
+  } catch (err: any) {
+    console.error('[Media Migration] ❌ Error executing media migration transfer:', err?.message || err);
+  }
+}
+
+let lastIntegrityCheck = 0;
+const INTEGRITY_COOLDOWN = 1000 * 60 * 5; // 5 minutes
+
+export async function verifySchemaIntegrity(force = false) {
+  if (!pool) {
+    console.warn('[Schema Integrity] Skipping validation: No core pool initialized.');
+    return;
+  }
+
+  const now = Date.now();
+  if (!force && (now - lastIntegrityCheck < INTEGRITY_COOLDOWN)) {
+    console.log('[Schema Integrity] Skipping comprehensive audit (recently verified).');
+    return;
+  }
+  
+  console.log('[Schema Integrity] Starting comprehensive database schema audit...');
+
+  const report: {
+    passed: boolean;
+    missingTables: { db: string; table: string }[];
+    missingColumns: { db: string; table: string; column: string; expectedType: string }[];
+    repairedTables: string[];
+    repairedColumns: string[];
+    errors: string[];
+  } = {
+    passed: true,
+    missingTables: [],
+    missingColumns: [],
+    repairedTables: [],
+    repairedColumns: [],
+    errors: []
+  };
+
+  const queryColumns = async (p: any, schemaName = 'public'): Promise<Record<string, Set<string>>> => {
+    if (!p) return {};
+    try {
+      const res = await p.query(`
+        SELECT table_name, column_name 
+        FROM information_schema.columns 
+        WHERE table_schema = $1
+      `, [schemaName]);
+
+      const tables: Record<string, Set<string>> = {};
+      for (const row of res.rows) {
+        if (!tables[row.table_name]) {
+          tables[row.table_name] = new Set();
+        }
+        tables[row.table_name].add(row.column_name);
+      }
+      return tables;
+    } catch (error) {
+      console.warn(`[Schema Integrity] Failed to query information_schema for a secondary pool, skipping that pool.`);
+      return {};
+    }
+  };
+
+  // Parallelize pool queries
+  const [coreTables, ledgerTables, externalTables, securityTables, mediaTables] = await Promise.all([
+    queryColumns(pool),
+    queryColumns(ledgerPool),
+    queryColumns(externalPool),
+    queryColumns(securityPool),
+    queryColumns(mediaPool)
+  ]);
+
+  const dbTables: Record<string, Record<string, Set<string>>> = {
+    core: coreTables,
+    ledger: ledgerTables,
+    external: externalTables,
+    security: securityTables,
+    media: mediaTables
+  };
+
+  const expectedSchema: Record<string, Record<string, { columns: string[]; repairCols?: Record<string, string | { type: string; default?: any }> }>> = {
+    core: {
+      users: {
+        columns: ['id', 'name', 'email', 'password_hash', 'role', 'status', 'kyc_status', 'kyc_required', 'kyc_rejection_reason', 'kyc_submitted_at', 'referred_by', 'language', 'theme', 'memory', 'support_notes', 'custom_instructions', 'last_active_at', 'created_at', 'updated_at', 'provider', 'avatar', 'referral_code', 'email_notifications', 'avatar_asset_id', 'media_muted', 'data_saver'],
+        repairCols: {
+          email_notifications: { type: 'BOOLEAN', default: 'true' },
+          avatar: { type: 'TEXT' },
+          referral_code: { type: 'VARCHAR(6)' },
+          avatar_asset_id: { type: 'UUID' },
+          media_muted: { type: 'BOOLEAN', default: 'true' },
+          data_saver: { type: 'BOOLEAN', default: 'false' }
+        }
+      },
+      user_sessions: {
+        columns: ['id', 'user_id', 'session_token', 'ip_address', 'user_agent', 'status', 'created_at', 'expires_at', 'last_active_at'],
+        repairCols: {
+          status: { type: 'VARCHAR(20)', default: "'active'" },
+          last_active_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      chats: {
+        columns: ['id', 'user_id', 'title', 'tool_id', 'context_summary', 'is_pinned', 'created_at', 'updated_at', 'tool']
+      },
+      messages: {
+        columns: ['id', 'chat_id', 'role', 'content', 'tool_id', 'model', 'tokens_used', 'feedback', 'thinking_steps', 'citations', 'follow_ups', 'generation_time', 'created_at', 'tool', 'is_pinned', 'updated_at']
+      },
+      api_keys_vault: {
+        columns: ['id', 'provider', 'encrypted_key', 'daily_budget', 'used_today', 'last_reset_date', 'models', 'model_list', 'is_active', 'created_at', 'updated_at', 'url_key', 'protocol_config']
+      },
+      tool_orchestrator: {
+        columns: ['id', 'tool_id', 'primary_provider', 'primary_model', 'fallback_1_provider', 'fallback_1_model', 'fallback_2_provider', 'fallback_2_model', 'fallback_3_provider', 'fallback_3_model', 'task_description', 'task_description_ar', 'is_active', 'updated_at', 'protocol_config', 'max_history_depth']
+      },
+      subscriptions: {
+        columns: ['id', 'user_id', 'plan_id', 'stripe_customer_id', 'stripe_subscription_id', 'status', 'billing_period', 'current_period_end', 'last_period_start', 'updated_at', 'created_at']
+      },
+      plans: {
+        columns: ['id', 'name_en', 'name_ar', 'desc_en', 'desc_ar', 'badge', 'discount', 'is_active', 'is_visible', 'is_popular', 'monthly_price', 'annual_price', 'color', 'features', 'limits', 'plan_type', 'created_at', 'updated_at']
+      },
+      user_usage: {
+        columns: ['id', 'user_id', 'tool_id', 'usage_count', 'usage_date', 'updated_at']
+      },
+      notifications: {
+        columns: ['id', 'user_id', 'type', 'title_en', 'title_ar', 'message_en', 'message_ar', 'is_read', 'created_at', 'metadata']
+      },
+      chat_memories: {
+        columns: ['id', 'user_id', 'chat_id', 'fact', 'source', 'category', 'created_at', 'updated_at']
+      },
+      email_templates: {
+        columns: ['id', 'name', 'subject_en', 'subject_ar', 'body_en', 'body_ar', 'created_at', 'updated_at']
+      },
+      email_settings: {
+        columns: ['id', 'mailer_type', 'smtp_host', 'smtp_port', 'smtp_encryption', 'smtp_username', 'smtp_password', 'sender_name', 'sender_email', 'status', 'last_verified_at', 'updated_at']
+      },
+      message_reports: {
+        columns: ['id', 'user_id', 'message_id', 'reason', 'status', 'created_at']
+      },
+      user_shortcuts: {
+        columns: ['id', 'user_id', 'title', 'query', 'category', 'created_at']
+      },
+      user_files: {
+        columns: ['id', 'user_id', 'chat_id', 'file_name', 'file_type', 'mime_type', 'file_size', 'file_url', 'file_content', 'metadata', 'created_at', 'updated_at']
+      },
+      system_settings: {
+        columns: ['id', 'site_name_en', 'site_name_ar', 'logo_url', 'logo_light_url', 'favicon_url', 'site_description_en', 'site_description_ar', 'seo_description_en', 'seo_description_ar', 'keywords_en', 'keywords_ar', 'google_analytics_id', 'google_site_verification', 'seo_image_url', 'stripe_publishable_key', 'stripe_secret_key', 'stripe_webhook_secret', 'stripe_live_mode', 'stripe_status', 'stripe_last_verified_at', 'paypal_client_id', 'paypal_client_secret', 'paypal_mode', 'paypal_status', 'paypal_last_verified_at', 'image_prompt_pref_threshold', 'blocked_paths', 'seo_site_name_en', 'seo_site_name_ar', 'updated_at', 'memory_limit_per_user', 'require_2fa_for_economy', 'bulletin_ad_daily_price', 'live_gift_commission_percent', 'sidebar_ad_impression_price', 'sidebar_ad_click_price', 'font_loading_config', 'font_config_ar', 'font_config_en', 'quota_warning_threshold_low', 'quota_warning_threshold_high', 'media_muted_default'],
+        repairCols: {
+          media_muted_default: { type: 'BOOLEAN', default: 'true' }
+        }
+      },
+      system_logs: {
+        columns: ['id', 'user_id', 'action', 'type', 'description', 'details', 'metadata', 'ip_address', 'created_at']
+      },
+      system_broadcasts: {
+        columns: ['id', 'admin_id', 'broadcast_type', 'type', 'target_group', 'target_role', 'title_en', 'title_ar', 'content_en', 'content_ar', 'status', 'sent_count', 'created_at']
+      },
+      oauth_states: {
+        columns: ['id', 'state', 'provider', 'redirect_url', 'expires_at', 'created_at']
+      },
+      bulletin_ads: {
+        columns: ['id', 'user_id', 'author_name', 'author_avatar', 'title', 'description', 'image_url', 'whatsapp_number', 'target_url', 'hashtags', 'category', 'price_paid', 'duration_days', 'status', 'rejection_reason', 'likes_count', 'comments_count', 'shares_count', 'clicks_count', 'impressions_count', 'starts_at', 'expires_at', 'page_id', 'location_city', 'phone_number', 'video_url', 'is_boosted', 'boosted_until', 'boost_tier', 'boost_price', 'created_at', 'updated_at', 'ad_format', 'aspect_ratio', 'quick_questions', 'feeling', 'tagged_users', 'is_ai_generated', 'has_whatsapp_button', 'meta_title_en', 'meta_title_ar', 'meta_description_en', 'meta_description_ar', 'keywords_en', 'keywords_ar', 'og_image_url'],
+        repairCols: {
+          aspect_ratio: { type: 'VARCHAR(50)', default: "'16:9'" },
+          meta_title_en: { type: 'VARCHAR(255)' },
+          image_asset_id: { type: 'UUID' },
+          meta_title_ar: { type: 'VARCHAR(255)' },
+          meta_description_en: { type: 'TEXT' },
+          meta_description_ar: { type: 'TEXT' },
+          keywords_en: { type: 'TEXT' },
+          keywords_ar: { type: 'TEXT' },
+          og_image_url: { type: 'TEXT' }
+        }
+      },
+      bulletin_saved_ads: {
+        columns: ['id', 'user_id', 'ad_id', 'created_at']
+      },
+      bulletin_reports: {
+        columns: ['id', 'user_id', 'ad_id', 'reason', 'details', 'status', 'created_at']
+      },
+      bulletin_pages: {
+        columns: ['id', 'user_id', 'name', 'slug', 'category', 'city', 'address', 'description', 'avatar_url', 'cover_url', 'whatsapp_number', 'phone_number', 'website_url', 'is_verified', 'followers_count', 'ads_count', 'created_at', 'updated_at']
+      },
+      bulletin_page_followers: {
+        columns: ['id', 'user_id', 'page_id', 'created_at']
+      },
+      bulletin_page_inquiries: {
+        columns: ['id', 'page_id', 'ad_id', 'sender_id', 'sender_name', 'sender_phone', 'message', 'status', 'created_at']
+      },
+      bulletin_ad_likes: {
+        columns: ['id', 'user_id', 'ad_id', 'created_at']
+      },
+      bulletin_ad_comments: {
+        columns: ['id', 'ad_id', 'user_id', 'author_name', 'author_avatar', 'content', 'parent_id', 'created_at']
+      },
+      bulletin_ad_messages: {
+        columns: ['id', 'ad_id', 'sender_id', 'recipient_id', 'sender_name', 'sender_avatar', 'message', 'media_url', 'is_encrypted', 'encryption_hash', 'status', 'created_at']
+      },
+      route_seo_settings: {
+        columns: ['id', 'route', 'title_ar', 'title_en', 'description_ar', 'description_en', 'keywords_ar', 'keywords_en', 'og_image_url', 'alt_text_ar', 'alt_text_en', 'is_active', 'created_at', 'updated_at']
+      },
+      route_seo_metadata: {
+        columns: ['route_path', 'title_ar', 'title_en', 'description_ar', 'description_en', 'og_image_url', 'updated_at']
+      },
+      seo_metadata: {
+        columns: ['id', 'route_path', 'entity_type', 'entity_id', 'title_en', 'title_ar', 'description_en', 'description_ar', 'og_image_url', 'og_image_alt_en', 'og_image_alt_ar', 'keywords_en', 'keywords_ar', 'canonical_url', 'structured_data', 'is_active', 'created_at', 'updated_at'],
+        repairCols: {
+          route_path: { type: 'VARCHAR(255)' },
+          entity_type: { type: 'VARCHAR(50)' },
+          entity_id: { type: 'VARCHAR(100)' },
+          title_en: { type: 'VARCHAR(255)' },
+          title_ar: { type: 'VARCHAR(255)' },
+          description_en: { type: 'TEXT' },
+          description_ar: { type: 'TEXT' },
+          og_image_url: { type: 'TEXT' },
+          og_image_alt_en: { type: 'TEXT' },
+          og_image_alt_ar: { type: 'TEXT' },
+          keywords_en: { type: 'TEXT' },
+          keywords_ar: { type: 'TEXT' },
+          canonical_url: { type: 'TEXT' },
+          structured_data: { type: 'JSONB', default: "'{}'" },
+          is_active: { type: 'BOOLEAN', default: true },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      asset_metadata: {
+        columns: ['id', 'file_url', 'asset_name', 'mime_type', 'file_size', 'alt_text_ar', 'alt_text_en', 'og_title_ar', 'og_title_en', 'og_description_ar', 'og_description_en', 'keywords_ar', 'keywords_en', 'visual_summary', 'ai_analysis_raw', 'created_at', 'updated_at']
+      },
+      user_activity_logs: {
+        columns: ['id', 'user_id', 'event_type', 'event_details', 'ip_address', 'user_agent', 'created_at'],
+        repairCols: {
+          event_type: { type: 'VARCHAR(100)', default: "'unknown'" },
+          event_details: { type: 'JSONB', default: "'{}'" },
+          ip_address: { type: 'VARCHAR(100)' },
+          user_agent: { type: 'TEXT' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      video_resources: {
+        columns: ['id', 'user_id', 'chat_id', 'message_id', 'file_url', 'prompt', 'provider', 'model', 'duration', 'aspect_ratio', 'resolution', 'metadata', 'created_at']
+      },
+      referral_invitations: {
+        columns: ['id', 'referrer_id', 'email', 'status', 'subject', 'body', 'referred_email', 'invite_code', 'created_at', 'updated_at']
+      },
+      shared_snapshots: {
+        columns: ['id', 'user_id', 'title', 'content', 'model_name', 'created_at', 'views_count']
+      },
+      gift_catalog: {
+        columns: ['id', 'name_ar', 'name_en', 'icon', 'points', 'is_active', 'created_at', 'updated_at']
+      },
+      google_tool_connections: {
+        columns: ['id', 'user_id', 'tool_id', 'is_connected', 'config', 'access_token', 'refresh_token', 'expires_at', 'scopes', 'last_connected_at', 'created_at', 'updated_at']
+      },
+      advertisements: {
+        columns: ['id', 'title_ar', 'title_en', 'description_ar', 'description_en', 'image_url', 'video_url', 'poster_url', 'target_url', 'sponsor_name', 'badge_text_ar', 'badge_text_en', 'position', 'format', 'display_order', 'is_active', 'meta_title_ar', 'meta_title_en', 'meta_description_ar', 'meta_description_en', 'keywords_ar', 'keywords_en', 'click_count', 'impression_count', 'start_date', 'end_date', 'created_at', 'updated_at'],
+        repairCols: {
+          video_url: { type: 'TEXT' },
+          poster_url: { type: 'TEXT' },
+          format: { type: 'VARCHAR(50)', default: "'sidebar'" },
+          meta_title_ar: { type: 'VARCHAR(255)' },
+          meta_title_en: { type: 'VARCHAR(255)' },
+          meta_description_ar: { type: 'TEXT' },
+          meta_description_en: { type: 'TEXT' },
+          keywords_ar: { type: 'TEXT' },
+          keywords_en: { type: 'TEXT' },
+          click_count: { type: 'INTEGER', default: 0 },
+          impression_count: { type: 'INTEGER', default: 0 },
+          start_date: { type: 'TIMESTAMP' },
+          end_date: { type: 'TIMESTAMP' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      user_recommendation_interactions: {
+        columns: ['id', 'user_id', 'item_type', 'item_id', 'item_key', 'action_type', 'category', 'weight', 'created_at']
+      },
+      user_recommendation_preferences: {
+        columns: ['user_id', 'preferred_categories', 'preferred_price_range', 'excluded_item_types', 'explicit_interests', 'updated_at']
+      },
+      user_media_preferences: {
+        columns: ['id', 'user_id', 'media_type', 'aspect_ratio', 'settings', 'updated_at']
+      },
+      recommendation_feedback: {
+        columns: ['id', 'user_id', 'item_type', 'item_id', 'item_key', 'feedback_type', 'created_at']
+      },
+      support_tickets: {
+        columns: ['id', 'user_id', 'subject', 'category', 'priority', 'status', 'created_at', 'updated_at']
+      },
+      support_ticket_replies: {
+        columns: ['id', 'ticket_id', 'user_id', 'message', 'is_admin_reply', 'created_at']
+      },
+      password_resets: {
+        columns: ['id', 'email', 'token', 'expires_at', 'created_at']
+      },
+      model_cost_audit_logs: {
+        columns: ['id', 'user_id', 'tool_id', 'provider', 'model', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'cost_usd', 'cost_credits', 'status', 'error_message', 'created_at']
+      },
+      admin_approval_queue: {
+        columns: ['id', 'requester_id', 'action_type', 'payload', 'status', 'verification_code', 'approver_id', 'rejection_reason', 'created_at', 'updated_at']
+      },
+      ad_pricing_audit: {
+        columns: ['id', 'admin_id', 'field_name', 'old_value', 'new_value', 'change_type', 'created_at']
+      },
+      ad_stats: {
+        columns: ['id', 'ad_id', 'type', 'ip_address', 'user_agent', 'created_at']
+      },
+      db_connections_registry: {
+        columns: ['id', 'provider', 'type', 'host', 'port', 'db_name', 'username', 'password', 'connection_string', 'ssl_mode', 'pool_size', 'is_active', 'status', 'last_checked_at', 'created_at', 'updated_at']
+      },
+      gpu_providers: {
+        columns: ['id', 'provider_id', 'name', 'provider_type', 'endpoint_id', 'base_url', 'api_url', 'encrypted_api_key', 'current_load_capacity', 'status', 'metadata', 'health_status', 'latency_ms', 'capabilities', 'daily_budget', 'used_today', 'last_reset_date', 'config', 'is_active', 'created_at', 'updated_at'],
+        repairCols: {
+          provider_id: { type: 'VARCHAR(100)' },
+          name: { type: 'VARCHAR(255)' },
+          provider_type: { type: 'VARCHAR(100)' },
+          endpoint_id: { type: 'VARCHAR(150)' },
+          base_url: { type: 'TEXT' },
+          api_url: { type: 'TEXT' },
+          encrypted_api_key: { type: 'TEXT' },
+          current_load_capacity: { type: 'INTEGER', default: 100 },
+          status: { type: 'VARCHAR(50)', default: "'active'" },
+          metadata: { type: 'JSONB', default: "'{}'" },
+          health_status: { type: 'VARCHAR(50)', default: "'offline'" },
+          latency_ms: { type: 'INTEGER', default: 0 },
+          capabilities: { type: 'TEXT[]' },
+          daily_budget: { type: 'NUMERIC(15, 4)', default: 0 },
+          used_today: { type: 'NUMERIC(15, 4)', default: 0 },
+          last_reset_date: { type: 'DATE', default: 'CURRENT_DATE' },
+          config: { type: 'JSONB', default: "'{}'" },
+          is_active: { type: 'BOOLEAN', default: true },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      gpu_provider_models: {
+        columns: ['id', 'provider_id', 'model_id', 'name', 'task_type', 'context_window', 'max_output_tokens', 'is_active', 'metadata', 'created_at'],
+        repairCols: {
+          provider_id: { type: 'INTEGER' },
+          model_id: { type: 'VARCHAR(255)' },
+          name: { type: 'VARCHAR(255)' },
+          task_type: { type: 'VARCHAR(100)' },
+          context_window: { type: 'INTEGER', default: 32768 },
+          max_output_tokens: { type: 'INTEGER', default: 4096 },
+          is_active: { type: 'BOOLEAN', default: true },
+          metadata: { type: 'JSONB', default: "'{}'" },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      gpu_execution_jobs: {
+        columns: ['id', 'job_id', 'user_id', 'provider_id', 'model_id', 'task_type', 'status', 'prompt', 'parameters', 'remote_job_id', 'result_url', 'result_data', 'latency_ms', 'error_message', 'attempts', 'failover_count', 'cost_charged', 'created_at', 'completed_at'],
+        repairCols: {
+          job_id: { type: 'VARCHAR(120)' },
+          user_id: { type: 'INTEGER' },
+          provider_id: { type: 'INTEGER' },
+          model_id: { type: 'VARCHAR(255)' },
+          task_type: { type: 'VARCHAR(100)' },
+          status: { type: 'VARCHAR(50)', default: "'pending'" },
+          prompt: { type: 'TEXT' },
+          parameters: { type: 'JSONB', default: "'{}'" },
+          remote_job_id: { type: 'VARCHAR(255)' },
+          result_url: { type: 'TEXT' },
+          result_data: { type: 'JSONB', default: "'{}'" },
+          latency_ms: { type: 'INTEGER', default: 0 },
+          error_message: { type: 'TEXT' },
+          attempts: { type: 'INTEGER', default: 1 },
+          failover_count: { type: 'INTEGER', default: 0 },
+          cost_charged: { type: 'NUMERIC(15, 4)', default: 0 },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          completed_at: { type: 'TIMESTAMP' }
+        }
+      },
+      admin_theme_customizations: {
+        columns: ['id', 'theme_mode', 'tokens', 'updated_at']
+      },
+      email_logs: {
+        columns: ['id', 'user_id', 'recipient_email', 'template_name', 'subject', 'status', 'is_sent', 'retry_count', 'last_error', 'sent_at', 'metadata', 'created_at', 'updated_at']
+      },
+      bulletin_ad_muted_notifications: {
+        columns: ['id', 'user_id', 'ad_id', 'created_at']
+      },
+      bulletin_comment_likes: {
+        columns: ['id', 'user_id', 'comment_id', 'created_at']
+      },
+      bulletin_hashtags: {
+        columns: ['id', 'tag', 'use_count', 'created_at', 'updated_at']
+      },
+      platform_categories: {
+        columns: ['id', 'name_ar', 'name_en', 'group_id', 'group_ar', 'group_en', 'icon', 'audience_reach', 'keywords', 'is_featured', 'created_at']
+      },
+      push_tokens: {
+        columns: ['id', 'user_id', 'platform', 'token', 'device_name', 'app_version', 'created_at', 'updated_at', 'is_active']
+      },
+      api_performance_logs: {
+        columns: ['id', 'endpoint', 'method', 'status_code', 'duration_ms', 'user_id', 'ip_address', 'user_agent', 'created_at']
+      },
+      forms: {
+        columns: ['id', 'title', 'slug', 'description', 'fields', 'settings', 'status', 'submissions_count', 'created_by', 'created_at', 'updated_at']
+      },
+      form_submissions: {
+        columns: ['id', 'form_id', 'user_id', 'data', 'created_at']
+      },
+      map_providers: {
+        columns: ['id', 'provider_key', 'name', 'api_key_encrypted', 'is_enabled', 'is_primary', 'priority', 'capabilities', 'config', 'status', 'last_tested_at', 'last_error', 'latency_ms', 'created_at', 'updated_at']
+      },
+      cached_locations: {
+        columns: ['id', 'place_id', 'title', 'city', 'state', 'country', 'country_code', 'lat', 'lon', 'full_address', 'category_label', 'raw_type', 'flag', 'source', 'hits', 'created_at', 'updated_at']
+      },
+      studio_workspaces: {
+        columns: ['id', 'user_id', 'title', 'framework_mode', 'files', 'created_at', 'updated_at']
+      },
+      studio_snapshots: {
+        columns: ['id', 'workspace_id', 'version_name', 'files', 'created_at']
+      },
+      og_preview_cache: {
+        columns: ['id', 'route_path', 'title', 'description', 'image_url', 'meta_data', 'created_at', 'updated_at']
+      }
+    },
+    ledger: {
+      wallets: {
+        columns: ['id', 'user_id', 'balance', 'usd_balance', 'points', 'total_deposited', 'total_withdrawn', 'total_earned_referral', 'is_frozen', 'currency', 'referral_activated', 'created_at', 'updated_at'],
+        repairCols: {
+          balance: { type: 'DECIMAL(10,2)', default: 0.00 },
+          usd_balance: { type: 'DECIMAL(10,2)', default: 0.00 },
+          points: { type: 'INTEGER', default: 0 },
+          total_deposited: { type: 'DECIMAL(10,2)', default: 0.00 },
+          total_withdrawn: { type: 'DECIMAL(10,2)', default: 0.00 },
+          total_earned_referral: { type: 'DECIMAL(10,2)', default: 0.00 },
+          is_frozen: { type: 'BOOLEAN', default: false },
+          currency: { type: 'VARCHAR(10)', default: "'USD'" },
+          referral_activated: { type: 'BOOLEAN', default: false },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      ledger_transactions: {
+        columns: ['id', 'wallet_id', 'user_id', 'amount', 'points', 'transaction_type', 'status', 'reference_id', 'metadata', 'ip_address', 'description', 'balance_after', 'is_hidden', 'created_at', 'updated_at'],
+        repairCols: {
+          transaction_type: { type: 'VARCHAR(50)' },
+          user_id: { type: 'INTEGER' },
+          wallet_id: { type: 'INTEGER' },
+          amount: { type: 'DECIMAL(10,2)', default: 0.00 },
+          points: { type: 'INTEGER', default: 0 },
+          status: { type: 'VARCHAR(50)', default: "'completed'" },
+          reference_id: { type: 'VARCHAR(255)' },
+          metadata: { type: 'JSONB', default: "'{}'" },
+          ip_address: { type: 'VARCHAR(45)' },
+          description: { type: 'TEXT' },
+          balance_after: { type: 'DECIMAL(10,2)', default: 0.00 },
+          is_hidden: { type: 'BOOLEAN', default: false },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      referrals: {
+        columns: ['id', 'referrer_id', 'referred_id', 'status', 'bonus_points', 'reward_amount', 'commission_earned', 'created_at'],
+        repairCols: {
+          referrer_id: { type: 'INTEGER' },
+          referred_id: { type: 'INTEGER' },
+          bonus_points: { type: 'DECIMAL(10,2)', default: 0.00 },
+          reward_amount: { type: 'DECIMAL(10,2)', default: 0.00 },
+          commission_earned: { type: 'DECIMAL(10,2)', default: 0.00 },
+          status: { type: 'VARCHAR(50)', default: "'pending'" },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      referral_tree: {
+        columns: ['id', 'ancestor_id', 'descendant_id', 'depth', 'referrer_id', 'referred_id', 'level', 'status', 'created_at'],
+        repairCols: {
+          ancestor_id: { type: 'INTEGER' },
+          descendant_id: { type: 'INTEGER' },
+          depth: { type: 'INTEGER', default: 1 },
+          referrer_id: { type: 'INTEGER' },
+          referred_id: { type: 'INTEGER' },
+          level: { type: 'INTEGER', default: 1 },
+          status: { type: 'VARCHAR(20)', default: "'active'" },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      kyc_requests: {
+        columns: ['id', 'user_id', 'full_name', 'nationality', 'document_type', 'document_number', 'document_front_url', 'document_back_url', 'selfie_url', 'status', 'rejection_reason', 'reviewed_by', 'reviewed_at', 'created_at'],
+        repairCols: {
+          user_id: { type: 'INTEGER' },
+          full_name: { type: 'VARCHAR(255)' },
+          nationality: { type: 'VARCHAR(100)' },
+          document_type: { type: 'VARCHAR(50)' },
+          document_number: { type: 'VARCHAR(100)' },
+          document_front_url: { type: 'TEXT' },
+          document_back_url: { type: 'TEXT' },
+          selfie_url: { type: 'TEXT' },
+          status: { type: 'VARCHAR(50)', default: "'pending'" },
+          rejection_reason: { type: 'TEXT' },
+          reviewed_by: { type: 'INTEGER' },
+          reviewed_at: { type: 'TIMESTAMP' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      withdrawal_requests: {
+        columns: ['id', 'user_id', 'amount', 'payout_method', 'payout_details', 'status', 'rejection_reason', 'processed_by', 'processed_at', 'transaction_hash', 'created_at'],
+        repairCols: {
+          user_id: { type: 'INTEGER' },
+          amount: { type: 'DECIMAL(10,2)', default: 0.00 },
+          payout_method: { type: 'VARCHAR(50)' },
+          payout_details: { type: 'JSONB', default: "'{}'" },
+          status: { type: 'VARCHAR(50)', default: "'pending'" },
+          rejection_reason: { type: 'TEXT' },
+          processed_by: { type: 'INTEGER' },
+          processed_at: { type: 'TIMESTAMP' },
+          transaction_hash: { type: 'VARCHAR(255)' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      payout_accounts: {
+        columns: ['id', 'user_id', 'payout_method', 'account_identifier', 'details', 'is_default', 'created_at'],
+        repairCols: {
+          user_id: { type: 'INTEGER' },
+          payout_method: { type: 'VARCHAR(50)' },
+          account_identifier: { type: 'TEXT' },
+          details: { type: 'JSONB', default: "'{}'" },
+          is_default: { type: 'BOOLEAN', default: false },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      economy_settings: {
+        columns: ['id', 'welcome_bonus_points', 'referral_bonus_points', 'min_withdrawal_cents', 'points_per_dollar', 'conversion_rate', 'referral_bonus_percent', 'min_payout_usd', 'min_deposit_usd', 'referral_activation_min_deposit', 'crypto_address', 'bank_name', 'bank_recipient', 'bank_iban', 'bank_swift', 'paypal_email', 'currency_symbol', 'exchange_rate_usd', 'min_withdrawal', 'withdrawal_fee_percent', 'referral_commission_percent', 'signup_bonus_credits', 'updated_at'],
+        repairCols: {
+          welcome_bonus_points: { type: 'INTEGER', default: 100 },
+          referral_bonus_points: { type: 'INTEGER', default: 50 },
+          min_withdrawal_cents: { type: 'INTEGER', default: 1000 },
+          points_per_dollar: { type: 'INTEGER', default: 100 },
+          conversion_rate: { type: 'DECIMAL(10,4)', default: 0.01 },
+          referral_bonus_percent: { type: 'DECIMAL(5,2)', default: 10.00 },
+          min_payout_usd: { type: 'DECIMAL(10,2)', default: 10.00 },
+          min_deposit_usd: { type: 'DECIMAL(10,2)', default: 5.00 },
+          referral_activation_min_deposit: { type: 'DECIMAL(10,2)', default: 10.00 },
+          crypto_address: { type: 'VARCHAR(255)' },
+          bank_name: { type: 'VARCHAR(255)' },
+          bank_recipient: { type: 'VARCHAR(255)' },
+          bank_iban: { type: 'VARCHAR(255)' },
+          bank_swift: { type: 'VARCHAR(255)' },
+          paypal_email: { type: 'VARCHAR(255)' },
+          currency_symbol: { type: 'VARCHAR(10)', default: "'$'" },
+          exchange_rate_usd: { type: 'DECIMAL(10,4)', default: 1.0 },
+          min_withdrawal: { type: 'DECIMAL(10,2)', default: 50 },
+          withdrawal_fee_percent: { type: 'DECIMAL(5,2)', default: 2.5 },
+          referral_commission_percent: { type: 'DECIMAL(5,2)', default: 10 },
+          signup_bonus_credits: { type: 'INTEGER', default: 100 },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      coupons: {
+        columns: ['id', 'code', 'discount_percent', 'discount_amount', 'max_uses', 'used_count', 'expires_at', 'is_active', 'created_at'],
+        repairCols: {
+          code: { type: 'VARCHAR(50)' },
+          discount_percent: { type: 'DECIMAL(5,2)', default: 0 },
+          discount_amount: { type: 'DECIMAL(10,2)', default: 0 },
+          max_uses: { type: 'INTEGER', default: 0 },
+          used_count: { type: 'INTEGER', default: 0 },
+          expires_at: { type: 'TIMESTAMP' },
+          is_active: { type: 'BOOLEAN', default: true },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      coupon_usages: {
+        columns: ['id', 'coupon_id', 'user_id', 'used_at'],
+        repairCols: {
+          coupon_id: { type: 'INTEGER' },
+          user_id: { type: 'INTEGER' },
+          used_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      stripe_events: {
+        columns: ['id', 'stripe_event_id', 'type', 'status', 'metadata', 'created_at', 'updated_at'],
+        repairCols: {
+          stripe_event_id: { type: 'VARCHAR(255)' },
+          type: { type: 'VARCHAR(100)' },
+          status: { type: 'VARCHAR(20)', default: "'processed'" },
+          metadata: { type: 'JSONB', default: "'{}'" },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      deposit_requests: {
+        columns: ['id', 'user_id', 'amount', 'currency', 'method', 'proof_url', 'status', 'rejection_reason', 'admin_id', 'created_at', 'updated_at'],
+        repairCols: {
+          user_id: { type: 'INTEGER' },
+          amount: { type: 'DECIMAL(10,2)', default: 0 },
+          currency: { type: 'VARCHAR(10)', default: "'USD'" },
+          method: { type: 'VARCHAR(50)' },
+          proof_url: { type: 'TEXT' },
+          status: { type: 'VARCHAR(20)', default: "'pending'" },
+          rejection_reason: { type: 'TEXT' },
+          admin_id: { type: 'INTEGER' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      }
+    },
+    external: {},
+    security: {
+      token_blacklist: {
+        columns: ['id', 'token', 'expires_at', 'created_at'],
+        repairCols: {
+          token: { type: 'TEXT' },
+          expires_at: { type: 'TIMESTAMP' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      security_alerts: {
+        columns: ['id', 'user_id', 'type', 'severity', 'description', 'metadata', 'is_resolved', 'ip_address', 'created_at', 'updated_at'],
+        repairCols: {
+          user_id: { type: 'INTEGER' },
+          type: { type: 'VARCHAR(100)' },
+          severity: { type: 'VARCHAR(50)', default: "'medium'" },
+          description: { type: 'TEXT' },
+          metadata: { type: 'JSONB', default: "'{}'" },
+          is_resolved: { type: 'BOOLEAN', default: false },
+          ip_address: { type: 'VARCHAR(100)' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+          updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      admin_audit_logs: {
+        columns: ['id', 'admin_id', 'admin_email', 'action', 'target_resource', 'details', 'ip_address', 'user_agent', 'created_at'],
+        repairCols: {
+          admin_id: { type: 'INTEGER' },
+          admin_email: { type: 'VARCHAR(255)' },
+          action: { type: 'VARCHAR(100)' },
+          target_resource: { type: 'VARCHAR(100)' },
+          details: { type: 'JSONB', default: "'{}'" },
+          ip_address: { type: 'VARCHAR(100)' },
+          user_agent: { type: 'TEXT' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      },
+      registered_agents: {
+        columns: ['id', 'client_id', 'client_secret', 'api_key_hash', 'client_name', 'identity_type', 'credential_type', 'redirect_uris', 'jwks_uri', 'user_agent', 'signature_keys', 'permissions', 'is_active', 'user_id', 'created_at'],
+        repairCols: {
+          client_id: { type: 'VARCHAR(255)' },
+          client_secret: { type: 'VARCHAR(255)' },
+          api_key_hash: { type: 'VARCHAR(255)' },
+          client_name: { type: 'VARCHAR(255)' },
+          identity_type: { type: 'VARCHAR(50)', default: "'agent'" },
+          credential_type: { type: 'VARCHAR(50)', default: "'client_credentials'" },
+          redirect_uris: { type: 'TEXT[]', default: "'{}'" },
+          jwks_uri: { type: 'VARCHAR(500)' },
+          user_agent: { type: 'VARCHAR(500)' },
+          signature_keys: { type: 'JSONB' },
+          permissions: { type: 'JSONB', default: "'[]'" },
+          is_active: { type: 'BOOLEAN', default: true },
+          user_id: { type: 'INTEGER' },
+          created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+        }
+      }
+    },
+    media: {
+      media_assets: {
+        columns: ['id', 'stored_path', 'original_filename', 'context', 'format', 'width', 'height', 'size_bytes', 'sha256_hash', 'is_public', 'user_id', 'metadata', 'file_data', 'created_at', 'updated_at'],
+        repairCols: {
+          context: { type: 'TEXT', default: "'general'" },
+          format: { type: 'TEXT', default: "'webp'" },
+          size_bytes: { type: 'BIGINT', default: 0 },
+          is_public: { type: 'BOOLEAN', default: true },
+          metadata: { type: 'JSONB', default: "'{}'" },
+          file_data: { type: 'BYTEA' }
+        }
+      },
+      canvas_sessions: {
+        columns: ['id', 'user_id', 'session_name', 'dimensions', 'state', 'thumbnail_url', 'is_active', 'created_at', 'updated_at'],
+        repairCols: {
+          dimensions: { type: 'JSONB', default: "'{\"width\": 800, \"height\": 600}'" },
+          state: { type: 'JSONB', default: "'{}'" },
+          is_active: { type: 'BOOLEAN', default: true }
+        }
+      },
+      canvas_history: {
+        columns: ['id', 'session_id', 'action_type', 'undo_state', 'redo_state', 'created_at'],
+        repairCols: {
+          undo_state: { type: 'JSONB', default: "'{}'" },
+          redo_state: { type: 'JSONB', default: "'{}'" }
+        }
+      },
+      user_audio_library: {
+        columns: ['id', 'user_id', 'user_name', 'user_avatar', 'title', 'artist', 'duration', 'audio_url', 'audio_type', 'category', 'source', 'source_ad_id', 'usage_count', 'likes_count', 'is_trending', 'is_public', 'license', 'metadata', 'created_at', 'updated_at'],
+        repairCols: {
+          audio_type: { type: 'VARCHAR(50)', default: "'music'" },
+          category: { type: 'VARCHAR(50)', default: "'trending'" },
+          source: { type: 'VARCHAR(50)', default: "'manual_upload'" },
+          is_public: { type: 'BOOLEAN', default: true },
+          license: { type: 'TEXT', default: "'Creative Commons CC0'" },
+          metadata: { type: 'JSONB', default: "'{}'" }
+        }
+      }
+    }
+  };
+
+  const indexMap: Record<string, string[]> = {
+    core: CORE_INDEXES,
+    ledger: LEDGER_INDEXES,
+    external: EXTERNAL_INDEXES,
+    security: SECURITY_INDEXES,
+    media: MEDIA_INDEXES
+  };
+
+  const verifyDbGroup = async (groupName: 'core' | 'ledger' | 'external' | 'security' | 'media', targetPoolObj: any, initialActiveTables: Record<string, Set<string>>) => {
+    if (!targetPoolObj) return;
+    try {
+      let activeTables = initialActiveTables;
+      const expectedTables = expectedSchema[groupName];
+      let repairedSomething = false;
+
+      for (const [tableName, spec] of Object.entries(expectedTables)) {
+        if (!activeTables[tableName]) {
+          report.passed = false;
+          report.missingTables.push({ db: groupName, table: tableName });
+          console.warn(`[Schema Integrity] Missing table: ${tableName} in database group ${groupName}`);
+
+          try {
+            console.log(`[Schema Integrity] Attempting table reconstruction for ${tableName}...`);
+            const { initDb } = await import("./index.js");
+            await initDb('additive', pool, ledgerPool, externalPool, securityPool, mediaPool);
+            report.repairedTables.push(tableName);
+            repairedSomething = true;
+            console.log(`[Schema Integrity] Table ${tableName} reconstructed successfully.`);
+            activeTables = await queryColumns(targetPoolObj);
+          } catch (repairErr) {
+            console.error(`[Schema Integrity] Reconstruction failed for table ${tableName}:`, repairErr instanceof Error ? repairErr.message : 'Unknown error');
+          }
+          continue;
+        }
+
+        const activeCols = activeTables[tableName];
+        for (const colName of spec.columns) {
+          if (!activeCols.has(colName)) {
+            report.passed = false;
+            const rCol = spec.repairCols?.[colName];
+            const expectedTypeStr = typeof rCol === 'string' ? rCol : (rCol ? `${rCol.type}${rCol.default !== undefined ? ' DEFAULT ' + rCol.default : ''}` : 'VARCHAR');
+            report.missingColumns.push({
+              db: groupName,
+              table: tableName,
+              column: colName,
+              expectedType: expectedTypeStr
+            });
+            console.warn(`[Schema Integrity] Missing column: ${tableName}.${colName} in database group ${groupName}`);
+
+            if (rCol) {
+              try {
+                const colConfig = typeof rCol === 'string' ? { type: rCol } : rCol;
+                await ensureColumnsBulk(targetPoolObj, tableName, {
+                  [colName]: colConfig
+                });
+                report.repairedColumns.push(`${tableName}.${colName}`);
+                repairedSomething = true;
+                console.log(`[Schema Integrity] Column ${tableName}.${colName} added successfully.`);
+              } catch (repairErr) {
+                console.error(`[Schema Integrity] Column repair failed for ${tableName}.${colName}:`, repairErr instanceof Error ? repairErr.message : 'Unknown error');
+              }
+            }
+          }
+        }
+      }
+
+      // If any table or column was repaired, re-apply the indexes for this group to guarantee no missing indexes
+      if (repairedSomething) {
+        const groupIndexes = indexMap[groupName] || [];
+        for (const idxQuery of groupIndexes) {
+          try {
+            await targetPoolObj.query(idxQuery);
+          } catch {
+            // Safe ignore if index already exists or notice
+          }
+        }
+      }
+    } catch (error) {
+      report.passed = false;
+      report.errors.push(`${groupName} DB: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.error(`[Schema Integrity] Error auditing database group ${groupName}:`, error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
+  await verifyDbGroup('core', pool, coreTables);
+  await verifyDbGroup('ledger', ledgerPool || pool, ledgerTables);
+  await verifyDbGroup('external', externalPool || pool, externalTables);
+  await verifyDbGroup('security', securityPool || pool, securityTables);
+  await verifyDbGroup('media', mediaPool || pool, mediaTables);
+
+  // Transfer any legacy media_assets data if running separate media database
+  await migrateMediaAssetsData();
+
+  if (report.passed) {
+    lastIntegrityCheck = Date.now();
+    console.log('[Schema Integrity] All expected tables and columns verified successfully across all active pools!');
+  } else {
+    console.warn(`[Schema Integrity] Schema verification detected deviations:`, {
+      missingTables: report.missingTables.length,
+      missingColumns: report.missingColumns.length,
+      repairedTables: report.repairedTables.length,
+      repairedColumns: report.repairedColumns.length
+    });
+  }
+
+  try {
+    await pool.query(`
+      INSERT INTO migration_security_audit (migration_name, status, error_message, details)
+      VALUES ($1, $2, $3, $4)
+    `, [
+      'schema_integrity_audit_verification',
+      report.passed ? 'info' : 'conflict',
+      report.passed ? 'No anomalies detected.' : `Detected missing tables/columns. Repaired: ${report.repairedColumns.length + report.repairedTables.length}`,
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        passed: report.passed,
+        missingTables: report.missingTables,
+        missingColumns: report.missingColumns,
+        repairedTables: report.repairedTables,
+        repairedColumns: report.repairedColumns,
+        errors: report.errors
+      })
+    ]);
+  } catch (dbErr) {
+    console.error('[Schema Integrity] Failed to write audit record to migration_security_audit:', dbErr instanceof Error ? dbErr.message : 'Unknown error');
+  }
+
+  // ===== VERIFY FK CONSTRAINTS =====
+  try {
+    const fkCheck = await pool.query(`
+      SELECT conname, conrelid::regclass AS table_name
+      FROM pg_constraint
+      WHERE contype = 'f' AND convalidated = false
+    `);
+
+    if (fkCheck.rows.length > 0) {
+      throw new Error(
+        `[Integrity] ${fkCheck.rows.length} FK constraints not validated: ` +
+        fkCheck.rows.map((r: any) => `${r.conname} on ${r.table_name}`).join(', ')
+      );
+    }
+    console.log(`[Integrity] ✅ All FK constraints validated`);
+  } catch (fkErr: any) {
+    if (fkErr?.message && fkErr.message.includes('[Integrity]')) {
+      throw fkErr;
+    }
+    console.warn(`[Integrity] FK verification notice:`, fkErr?.message || fkErr);
+  }
+  // =================================
+}
+
+export const ensureIntegrity = verifySchemaIntegrity;
+

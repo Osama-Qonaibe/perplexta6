@@ -1,0 +1,2181 @@
+import bcrypt from 'bcryptjs';
+import type { QueryClient, ForeignKeyRelation } from './types.js';
+import { ensureColumnsBulk, ensureForeignKey } from './helpers.js';
+
+export const CORE_SCHEMA_TABLES: { name: string; query: string }[] = [
+  {
+    name: 'admin_theme_customizations',
+    query: `CREATE TABLE IF NOT EXISTS admin_theme_customizations (
+        id SERIAL PRIMARY KEY,
+        theme_mode VARCHAR(10) NOT NULL UNIQUE,
+        tokens JSONB DEFAULT '{}',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'users',
+    query: `CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        password_hash TEXT,
+        role VARCHAR(50) DEFAULT 'user' CHECK (role IN ('user', 'admin', 'moderator')),
+        status VARCHAR(50) DEFAULT 'active',
+        kyc_status VARCHAR(50) DEFAULT 'none',
+        kyc_required BOOLEAN DEFAULT false,
+        kyc_rejection_reason TEXT,
+        kyc_submitted_at TIMESTAMP,
+        referred_by INTEGER,
+        language VARCHAR(5) DEFAULT 'en',
+        theme VARCHAR(10) DEFAULT 'light',
+        memory TEXT,
+        support_notes TEXT,
+        custom_instructions TEXT,
+        last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        provider VARCHAR(50) DEFAULT 'local',
+        avatar TEXT,
+        avatar_asset_id UUID,
+        referral_code VARCHAR(10) UNIQUE,
+        email_notifications BOOLEAN DEFAULT true,
+        media_muted BOOLEAN DEFAULT true,
+        data_saver BOOLEAN DEFAULT false
+      )`
+  },
+  {
+    name: 'password_resets',
+    query: `CREATE TABLE IF NOT EXISTS password_resets (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        token VARCHAR(255) UNIQUE NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'chats',
+    query: `CREATE TABLE IF NOT EXISTS chats (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) DEFAULT 'New Analysis',
+        tool_id VARCHAR(100) DEFAULT 'chat_fast',
+        context_summary TEXT,
+        is_pinned BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        tool VARCHAR(100) DEFAULT 'chat_fast'
+      )`
+  },
+  {
+    name: 'messages',
+    query: `CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+        role VARCHAR(50) NOT NULL,
+        content TEXT NOT NULL,
+        tool_id VARCHAR(100),
+        model VARCHAR(255),
+        tokens_used INTEGER DEFAULT 0,
+        feedback SMALLINT DEFAULT 0,
+        thinking_steps JSONB DEFAULT '[]',
+        citations JSONB DEFAULT '[]',
+        follow_ups JSONB DEFAULT '[]',
+        generation_time NUMERIC,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        tool VARCHAR(100),
+        is_pinned BOOLEAN DEFAULT false,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'api_keys_vault',
+    query: `CREATE TABLE IF NOT EXISTS api_keys_vault (
+        id SERIAL PRIMARY KEY,
+        provider VARCHAR(100) NOT NULL CONSTRAINT api_keys_vault_provider_key UNIQUE,
+        encrypted_key TEXT NOT NULL,
+        daily_budget NUMERIC(15, 4) DEFAULT '0',
+        used_today NUMERIC(15, 4) DEFAULT '0',
+        last_reset_date DATE DEFAULT CURRENT_DATE,
+        models JSONB DEFAULT '[]',
+        model_list JSONB DEFAULT '[]',
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        url_key TEXT,
+        protocol_config JSONB DEFAULT '{}'
+      )`
+  },
+  {
+    name: 'tool_orchestrator',
+    query: `CREATE TABLE IF NOT EXISTS tool_orchestrator (
+        id SERIAL PRIMARY KEY,
+        tool_id VARCHAR(100) UNIQUE NOT NULL,
+        primary_provider VARCHAR(100),
+        primary_model VARCHAR(255),
+        fallback_1_provider VARCHAR(100),
+        fallback_1_model VARCHAR(255),
+        fallback_2_provider VARCHAR(100),
+        fallback_2_model VARCHAR(255),
+        fallback_3_provider VARCHAR(100),
+        fallback_3_model VARCHAR(255),
+        task_description TEXT,
+        task_description_ar TEXT,
+        is_active BOOLEAN DEFAULT true,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        protocol_config JSONB DEFAULT '{}',
+        max_history_depth INTEGER DEFAULT 16
+      )`
+  },
+  {
+    name: 'google_tool_connections',
+    query: `CREATE TABLE IF NOT EXISTS google_tool_connections (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tool_id VARCHAR(100) NOT NULL,
+        is_connected BOOLEAN DEFAULT false,
+        config JSONB DEFAULT '{}',
+        access_token TEXT,
+        refresh_token TEXT,
+        expires_at TIMESTAMP,
+        scopes TEXT[],
+        last_connected_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, tool_id)
+      )`
+  },
+  {
+    name: 'support_tickets',
+    query: `CREATE TABLE IF NOT EXISTS support_tickets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        subject VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        status VARCHAR(20) DEFAULT 'open',
+        priority VARCHAR(20) DEFAULT 'medium',
+        category VARCHAR(50) DEFAULT 'general',
+        assigned_to INTEGER,
+        last_reply_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'support_ticket_replies',
+    query: `CREATE TABLE IF NOT EXISTS support_ticket_replies (
+        id SERIAL PRIMARY KEY,
+        ticket_id INTEGER REFERENCES support_tickets(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id),
+        message TEXT NOT NULL,
+        is_admin_reply BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'plans',
+    query: `CREATE TABLE IF NOT EXISTS plans (
+        id SERIAL PRIMARY KEY,
+        name_en VARCHAR(255) NOT NULL CONSTRAINT plans_name_en_key UNIQUE,
+        name_ar VARCHAR(255) NOT NULL,
+        desc_en TEXT,
+        desc_ar TEXT,
+        badge VARCHAR(50) DEFAULT 'none',
+        discount INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        is_visible BOOLEAN DEFAULT true,
+        is_popular BOOLEAN DEFAULT false,
+        hide_tools BOOLEAN DEFAULT false,
+        monthly_price NUMERIC(10, 2) NOT NULL DEFAULT 0,
+        annual_price NUMERIC(10, 2) NOT NULL DEFAULT 0,
+        is_monthly_enabled BOOLEAN DEFAULT true,
+        is_annual_enabled BOOLEAN DEFAULT true,
+        is_daily_enabled BOOLEAN DEFAULT false,
+        daily_price NUMERIC(10, 2) DEFAULT 0,
+        daily_days INTEGER DEFAULT 7,
+        daily_credits INTEGER DEFAULT 0,
+        monthly_credits INTEGER DEFAULT 0,
+        annual_credits INTEGER DEFAULT 0,
+        color VARCHAR(50) DEFAULT 'accent',
+        features JSONB DEFAULT '[]',
+        limits JSONB DEFAULT '{}',
+        plan_type VARCHAR(100) DEFAULT 'user',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'subscriptions',
+    query: `CREATE TABLE IF NOT EXISTS subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        plan_id INTEGER REFERENCES plans(id),
+        stripe_customer_id VARCHAR(255),
+        stripe_subscription_id VARCHAR(255),
+        status VARCHAR(50) DEFAULT 'active',
+        billing_period VARCHAR(20) DEFAULT 'monthly',
+        current_period_end TIMESTAMP,
+        cycle_credits INTEGER DEFAULT 0,
+        used_credits INTEGER DEFAULT 0,
+        last_reset_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_period_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'user_usage',
+    query: `CREATE TABLE IF NOT EXISTS user_usage (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        tool_id VARCHAR(50) NOT NULL,
+        usage_count INTEGER DEFAULT 0,
+        usage_date DATE DEFAULT CURRENT_DATE,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT user_usage_user_id_tool_id_usage_date_key UNIQUE(user_id, tool_id, usage_date)
+      )`
+  },
+  {
+    name: 'notifications',
+    query: `CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title_en VARCHAR(255) NOT NULL,
+        title_ar VARCHAR(255) NOT NULL,
+        message_en TEXT NOT NULL,
+        message_ar TEXT NOT NULL,
+        type VARCHAR(50) DEFAULT 'info',
+        is_read BOOLEAN DEFAULT false,
+        is_sent BOOLEAN DEFAULT false,
+        sent_at TIMESTAMP,
+        retry_count INTEGER DEFAULT 0,
+        last_error TEXT,
+        action_url TEXT,
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'email_logs',
+    query: `CREATE TABLE IF NOT EXISTS email_logs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        recipient_email VARCHAR(255) NOT NULL,
+        template_name VARCHAR(255) NOT NULL DEFAULT 'custom',
+        subject VARCHAR(255) NOT NULL DEFAULT '',
+        status VARCHAR(50) DEFAULT 'pending',
+        is_sent BOOLEAN DEFAULT false,
+        retry_count INTEGER DEFAULT 0,
+        last_error TEXT,
+        sent_at TIMESTAMP,
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'chat_memories',
+    query: `CREATE TABLE IF NOT EXISTS chat_memories (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+        fact TEXT NOT NULL,
+        source VARCHAR(20) DEFAULT 'ai',
+        category VARCHAR(50) DEFAULT 'general',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'email_templates',
+    query: `CREATE TABLE IF NOT EXISTS email_templates (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) UNIQUE NOT NULL,
+        subject_en VARCHAR(255),
+        subject_ar VARCHAR(255),
+        body_en TEXT,
+        body_ar TEXT,
+        type VARCHAR(50) DEFAULT 'custom',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'email_settings',
+    query: `CREATE TABLE IF NOT EXISTS email_settings (
+        id SERIAL PRIMARY KEY,
+        mailer_type VARCHAR(50) DEFAULT 'smtp',
+        smtp_host VARCHAR(255),
+        smtp_port VARCHAR(10),
+        smtp_encryption VARCHAR(50) DEFAULT 'tls',
+        smtp_username VARCHAR(255),
+        smtp_password TEXT,
+        sender_name VARCHAR(255),
+        sender_email VARCHAR(255),
+        status VARCHAR(20) DEFAULT 'active',
+        last_verified_at TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'message_reports',
+    query: `CREATE TABLE IF NOT EXISTS message_reports (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        message_id INTEGER,
+        reason TEXT,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'user_shortcuts',
+    query: `CREATE TABLE IF NOT EXISTS user_shortcuts (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        query TEXT NOT NULL,
+        category VARCHAR(50) DEFAULT 'general',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'system_settings',
+    query: `CREATE TABLE IF NOT EXISTS system_settings (
+        id SERIAL PRIMARY KEY,
+        site_name_en VARCHAR(255) DEFAULT 'Perplexta',
+        site_name_ar VARCHAR(255) DEFAULT 'بيربليكستا',
+        logo_url TEXT,
+        logo_light_url TEXT,
+        favicon_url TEXT,
+        site_description_en TEXT,
+        site_description_ar TEXT,
+        seo_description_en TEXT,
+        seo_description_ar TEXT,
+        keywords_en TEXT,
+        keywords_ar TEXT,
+        google_analytics_id VARCHAR(100),
+        google_site_verification VARCHAR(255),
+        seo_image_url TEXT,
+        stripe_publishable_key TEXT,
+        stripe_secret_key TEXT,
+        stripe_webhook_secret TEXT,
+        stripe_live_mode BOOLEAN DEFAULT false,
+        stripe_status VARCHAR(50) DEFAULT 'pending',
+        stripe_last_verified_at TIMESTAMP,
+        paypal_client_id TEXT,
+        paypal_client_secret TEXT,
+        paypal_mode VARCHAR(20) DEFAULT 'sandbox',
+        paypal_status VARCHAR(50) DEFAULT 'pending',
+        paypal_last_verified_at TIMESTAMP,
+        image_prompt_pref_threshold INTEGER DEFAULT 150,
+        blocked_paths TEXT DEFAULT '',
+        seo_site_name_en TEXT,
+        seo_site_name_ar TEXT,
+        font_loading_config TEXT,
+        font_config_ar TEXT,
+        font_config_en TEXT,
+        bulletin_ad_daily_price NUMERIC(10,2) DEFAULT 5.00,
+        live_gift_commission_percent INTEGER DEFAULT 30,
+        sidebar_ad_impression_price NUMERIC(10,4) DEFAULT 0.0100,
+        sidebar_ad_click_price NUMERIC(10,2) DEFAULT 0.10,
+        sidebar_ads_enabled BOOLEAN DEFAULT TRUE,
+        memory_limit_per_user INTEGER DEFAULT 50,
+        quota_warning_threshold_low INTEGER DEFAULT 50,
+        quota_warning_threshold_high INTEGER DEFAULT 80,
+        require_2fa_for_economy BOOLEAN DEFAULT false,
+        media_muted_default BOOLEAN DEFAULT true,
+        google_client_id VARCHAR(255),
+        google_client_secret TEXT,
+        firebase_project_id VARCHAR(255),
+        firebase_client_email VARCHAR(255),
+        firebase_private_key TEXT,
+        firebase_service_account_path TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'gift_catalog',
+    query: `CREATE TABLE IF NOT EXISTS gift_catalog (
+        id SERIAL PRIMARY KEY,
+        name_ar VARCHAR(255) NOT NULL,
+        name_en VARCHAR(255) NOT NULL,
+        icon TEXT NOT NULL,
+        points INTEGER NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'system_broadcasts',
+    query: `CREATE TABLE IF NOT EXISTS system_broadcasts (
+        id SERIAL PRIMARY KEY,
+        admin_id INTEGER REFERENCES users(id),
+        broadcast_type VARCHAR(50) DEFAULT 'system',
+        type VARCHAR(50) DEFAULT 'system',
+        target_group VARCHAR(50) DEFAULT 'all',
+        target_role VARCHAR(20) DEFAULT 'all',
+        title_en VARCHAR(255),
+        title_ar VARCHAR(255),
+        content_en TEXT,
+        content_ar TEXT,
+        status VARCHAR(20) DEFAULT 'completed',
+        sent_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'user_files',
+    query: `CREATE TABLE IF NOT EXISTS user_files (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id INTEGER REFERENCES chats(id) ON DELETE SET NULL,
+        file_name VARCHAR(255) NOT NULL,
+        file_type VARCHAR(100),
+        mime_type VARCHAR(100),
+        file_size INTEGER,
+        file_url TEXT,
+        file_content TEXT,
+        metadata JSONB DEFAULT '{}',
+        file_version INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        file_data BYTEA
+      )`
+  },
+  {
+    name: 'system_logs',
+    query: `CREATE TABLE IF NOT EXISTS system_logs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        action VARCHAR(255),
+        type VARCHAR(100) DEFAULT 'info',
+        description TEXT,
+        details JSONB DEFAULT '{}',
+        metadata JSONB DEFAULT '{}',
+        ip_address VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'user_activity_logs',
+    query: `CREATE TABLE IF NOT EXISTS user_activity_logs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        event_type VARCHAR(100) NOT NULL,
+        event_details JSONB DEFAULT '{}',
+        ip_address VARCHAR(100),
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'oauth_states',
+    query: `CREATE TABLE IF NOT EXISTS oauth_states (
+        id SERIAL PRIMARY KEY,
+        state VARCHAR(255) UNIQUE NOT NULL,
+        provider VARCHAR(50) NOT NULL,
+        redirect_url TEXT,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'video_resources',
+    query: `CREATE TABLE IF NOT EXISTS video_resources (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+        message_id INTEGER,
+        file_url TEXT NOT NULL,
+        prompt TEXT,
+        provider VARCHAR(100),
+        model VARCHAR(100),
+        duration INTEGER,
+        aspect_ratio VARCHAR(50),
+        resolution VARCHAR(50),
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'referral_invitations',
+    query: `CREATE TABLE IF NOT EXISTS referral_invitations (
+        id SERIAL PRIMARY KEY,
+        referrer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        email VARCHAR(255) NOT NULL,
+        status VARCHAR(50) DEFAULT 'sent',
+        subject VARCHAR(255),
+        body TEXT,
+        referred_email VARCHAR(255),
+        invite_code VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'shared_snapshots',
+    query: `CREATE TABLE IF NOT EXISTS shared_snapshots (
+        id VARCHAR(100) PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        title TEXT,
+        content TEXT NOT NULL,
+        model_name VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        views_count INTEGER DEFAULT 0
+      )`
+  },
+  {
+    name: 'advertisements',
+    query: `CREATE TABLE IF NOT EXISTS advertisements (
+        id SERIAL PRIMARY KEY,
+        title_ar VARCHAR(255) NOT NULL,
+        title_en VARCHAR(255) NOT NULL,
+        description_ar TEXT,
+        description_en TEXT,
+        image_url TEXT NOT NULL,
+        video_url TEXT,
+        poster_url TEXT,
+        target_url TEXT NOT NULL,
+        sponsor_name VARCHAR(100),
+        badge_text_ar VARCHAR(50) DEFAULT 'مُموَّل',
+        badge_text_en VARCHAR(50) DEFAULT 'Sponsored',
+        position VARCHAR(50) DEFAULT 'sidebar',
+        format VARCHAR(50) DEFAULT 'sidebar',
+        display_order INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        meta_title_ar VARCHAR(255),
+        meta_title_en VARCHAR(255),
+        meta_description_ar TEXT,
+        meta_description_en TEXT,
+        keywords_ar TEXT,
+        keywords_en TEXT,
+        click_count INTEGER DEFAULT 0,
+        impression_count INTEGER DEFAULT 0,
+        start_date TIMESTAMP,
+        end_date TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'bulletin_ads',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_ads (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        author_name VARCHAR(255),
+        author_avatar TEXT,
+        title VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        image_url TEXT,
+        whatsapp_number VARCHAR(50),
+        target_url TEXT,
+        hashtags TEXT DEFAULT '',
+        category VARCHAR(100) DEFAULT 'عام / General',
+        price_paid NUMERIC(10,2) DEFAULT 0,
+        duration_days INTEGER DEFAULT 7,
+        status VARCHAR(50) DEFAULT 'pending',
+        rejection_reason TEXT,
+        likes_count INTEGER DEFAULT 0,
+        comments_count INTEGER DEFAULT 0,
+        shares_count INTEGER DEFAULT 0,
+        clicks_count INTEGER DEFAULT 0,
+        impressions_count INTEGER DEFAULT 0,
+        starts_at TIMESTAMP,
+        expires_at TIMESTAMP,
+        page_id INTEGER,
+        location_city VARCHAR(100) DEFAULT 'فلسطين',
+        phone_number VARCHAR(50),
+        video_url TEXT,
+        is_boosted BOOLEAN DEFAULT FALSE,
+        boosted_until TIMESTAMP,
+        boost_tier VARCHAR(50),
+        boost_price NUMERIC(10,2) DEFAULT 0,
+        audience VARCHAR(50) DEFAULT 'public',
+        ad_format VARCHAR(50) DEFAULT 'post',
+        aspect_ratio VARCHAR(50) DEFAULT '16:9',
+        quick_questions JSONB DEFAULT '[]',
+        feeling VARCHAR(100),
+        tagged_users JSONB DEFAULT '[]',
+        is_ai_generated BOOLEAN DEFAULT FALSE,
+        has_whatsapp_button BOOLEAN DEFAULT FALSE,
+        meta_title_en VARCHAR(255),
+        meta_title_ar VARCHAR(255),
+        meta_description_en TEXT,
+        meta_description_ar TEXT,
+        keywords_en TEXT,
+        keywords_ar TEXT,
+        og_image_url TEXT,
+        media_urls JSONB DEFAULT '[]'::JSONB,
+        metadata JSONB DEFAULT '{}'::JSONB,
+        post_code VARCHAR(50),
+        author_username VARCHAR(100),
+        audio_url TEXT,
+        audio_title VARCHAR(255),
+        audio_artist VARCHAR(255),
+        audio_track_id VARCHAR(100),
+        view_count INTEGER DEFAULT 0,
+        click_count INTEGER DEFAULT 0,
+        is_featured BOOLEAN DEFAULT FALSE,
+        is_pinned BOOLEAN DEFAULT FALSE,
+        priority INTEGER DEFAULT 0,
+        badge_text VARCHAR(100),
+        cta_label VARCHAR(100),
+        cta_action VARCHAR(50),
+        cta_payload TEXT,
+        cta_style VARCHAR(50),
+        badge_color VARCHAR(50),
+        tags TEXT[] DEFAULT '{}',
+        who_can_comment VARCHAR(50) DEFAULT 'anyone',
+        allow_translation BOOLEAN DEFAULT TRUE,
+        partnership_code VARCHAR(100),
+        is_partnership BOOLEAN DEFAULT FALSE,
+        partnership_brand VARCHAR(255),
+        deleted_at TIMESTAMP,
+        archived_at TIMESTAMP,
+        boost_goal VARCHAR(100) DEFAULT 'whatsapp_leads',
+        boost_daily_budget NUMERIC(10,2) DEFAULT 2.00,
+        boost_settings JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'bulletin_saved_ads',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_saved_ads (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        ad_id INTEGER NOT NULL REFERENCES bulletin_ads(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, ad_id)
+      )`
+  },
+  {
+    name: 'bulletin_ad_muted_notifications',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_ad_muted_notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        ad_id INTEGER NOT NULL REFERENCES bulletin_ads(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, ad_id)
+      )`
+  },
+  {
+    name: 'bulletin_reports',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_reports (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        ad_id INTEGER NOT NULL REFERENCES bulletin_ads(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        details TEXT,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'bulletin_pages',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_pages (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255),
+        category VARCHAR(100) DEFAULT 'تجارة إلكترونية / E-Commerce',
+        city VARCHAR(100) DEFAULT 'غزة',
+        address TEXT,
+        description TEXT NOT NULL,
+        avatar_url TEXT NOT NULL,
+        cover_url TEXT NOT NULL,
+        whatsapp_number VARCHAR(50),
+        phone_number VARCHAR(50),
+        website_url TEXT,
+        is_verified BOOLEAN DEFAULT TRUE,
+        followers_count INTEGER DEFAULT 0,
+        ads_count INTEGER DEFAULT 0,
+        managers JSONB DEFAULT '[]'::JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'bulletin_page_followers',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_page_followers (
+        id SERIAL PRIMARY KEY,
+        page_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(page_id, user_id)
+      )`
+  },
+  {
+    name: 'bulletin_page_inquiries',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_page_inquiries (
+        id SERIAL PRIMARY KEY,
+        page_id INTEGER,
+        ad_id INTEGER,
+        sender_id INTEGER NOT NULL,
+        sender_name VARCHAR(255),
+        sender_phone VARCHAR(50),
+        message TEXT NOT NULL,
+        status VARCHAR(50) DEFAULT 'unread',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'bulletin_ad_likes',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_ad_likes (
+        id SERIAL PRIMARY KEY,
+        ad_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        reaction VARCHAR(20) DEFAULT 'like',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(ad_id, user_id)
+      )`
+  },
+  {
+    name: 'bulletin_ad_comments',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_ad_comments (
+        id SERIAL PRIMARY KEY,
+        ad_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        author_name VARCHAR(255),
+        author_avatar TEXT,
+        content TEXT NOT NULL,
+        parent_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'bulletin_comment_likes',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_comment_likes (
+        id SERIAL PRIMARY KEY,
+        comment_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        reaction VARCHAR(20) DEFAULT 'like',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(comment_id, user_id)
+      )`
+  },
+  {
+    name: 'bulletin_ad_messages',
+    query: `CREATE TABLE IF NOT EXISTS bulletin_ad_messages (
+        id SERIAL PRIMARY KEY,
+        ad_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+        recipient_id INTEGER NOT NULL,
+        sender_name VARCHAR(255),
+        sender_avatar TEXT,
+        message TEXT NOT NULL,
+        media_url TEXT,
+        is_encrypted BOOLEAN DEFAULT TRUE,
+        encryption_hash VARCHAR(255),
+        status VARCHAR(50) DEFAULT 'sent',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'route_seo_settings',
+    query: `CREATE TABLE IF NOT EXISTS route_seo_settings (
+        id SERIAL PRIMARY KEY,
+        route VARCHAR(255) UNIQUE NOT NULL,
+        title_ar TEXT,
+        title_en TEXT,
+        description_ar TEXT,
+        description_en TEXT,
+        keywords_ar TEXT,
+        keywords_en TEXT,
+        og_image_url TEXT,
+        alt_text_ar TEXT,
+        alt_text_en TEXT,
+        is_active BOOLEAN DEFAULT true,
+        is_dynamic BOOLEAN DEFAULT false,
+        route_pattern VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'asset_metadata',
+    query: `CREATE TABLE IF NOT EXISTS asset_metadata (
+        id SERIAL PRIMARY KEY,
+        file_url TEXT UNIQUE NOT NULL,
+        asset_name VARCHAR(255),
+        mime_type VARCHAR(100),
+        file_size BIGINT,
+        alt_text_ar TEXT,
+        alt_text_en TEXT,
+        og_title_ar TEXT,
+        og_title_en TEXT,
+        og_description_ar TEXT,
+        og_description_en TEXT,
+        keywords_ar TEXT,
+        keywords_en TEXT,
+        visual_summary TEXT,
+        ai_analysis_raw JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'user_recommendation_interactions',
+    query: `CREATE TABLE IF NOT EXISTS user_recommendation_interactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_type VARCHAR(50) NOT NULL,
+        item_id INTEGER,
+        item_key VARCHAR(255),
+        action_type VARCHAR(50) NOT NULL,
+        category VARCHAR(100),
+        weight NUMERIC(5,2) DEFAULT 1.0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'user_recommendation_preferences',
+    query: `CREATE TABLE IF NOT EXISTS user_recommendation_preferences (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        preferred_categories JSONB DEFAULT '[]',
+        preferred_price_range JSONB DEFAULT '{"min": 0, "max": 10000}',
+        excluded_item_types JSONB DEFAULT '[]',
+        explicit_interests JSONB DEFAULT '[]',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'platform_categories',
+    query: `CREATE TABLE IF NOT EXISTS platform_categories (
+        id VARCHAR(100) PRIMARY KEY,
+        name_ar VARCHAR(255) NOT NULL,
+        name_en VARCHAR(255) NOT NULL,
+        group_id VARCHAR(100) NOT NULL,
+        group_ar VARCHAR(255) NOT NULL,
+        group_en VARCHAR(255) NOT NULL,
+        icon VARCHAR(50) DEFAULT 'Layers',
+        audience_reach BIGINT DEFAULT 150000,
+        keywords TEXT[] DEFAULT '{}',
+        is_featured BOOLEAN DEFAULT false,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )`
+  },
+  {
+    name: 'user_media_preferences',
+    query: `CREATE TABLE IF NOT EXISTS user_media_preferences (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        media_type VARCHAR(50) NOT NULL,
+        aspect_ratio VARCHAR(20) NOT NULL DEFAULT '16:9',
+        settings JSONB DEFAULT '{}',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_user_media_preferences UNIQUE (user_id, media_type)
+      )`
+  },
+  {
+    name: 'recommendation_feedback',
+    query: `CREATE TABLE IF NOT EXISTS recommendation_feedback (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_type VARCHAR(50) NOT NULL,
+        item_id INTEGER,
+        item_key VARCHAR(255),
+        feedback_type VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'user_sessions',
+    query: `CREATE TABLE IF NOT EXISTS user_sessions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        session_token TEXT UNIQUE NOT NULL,
+        ip_address VARCHAR(100),
+        user_agent TEXT,
+        status VARCHAR(20) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'model_cost_audit_logs',
+    query: `CREATE TABLE IF NOT EXISTS model_cost_audit_logs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tool_id VARCHAR(50),
+        provider VARCHAR(50),
+        model VARCHAR(100),
+        prompt_tokens INTEGER DEFAULT 0,
+        completion_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        cost_usd DECIMAL(10, 6) DEFAULT 0,
+        cost_credits INTEGER DEFAULT 0,
+        status VARCHAR(50) DEFAULT 'success',
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'admin_approval_queue',
+    query: `CREATE TABLE IF NOT EXISTS admin_approval_queue (
+        id SERIAL PRIMARY KEY,
+        requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        action_type VARCHAR(100) NOT NULL,
+        payload JSONB NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending',
+        verification_code VARCHAR(10),
+        approver_id INTEGER,
+        rejection_reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'ad_pricing_audit',
+    query: `CREATE TABLE IF NOT EXISTS ad_pricing_audit (
+        id SERIAL PRIMARY KEY,
+        admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        field_name VARCHAR(100) NOT NULL,
+        old_value NUMERIC(10,4),
+        new_value NUMERIC(10,4),
+        change_type VARCHAR(50) DEFAULT 'manual',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'ad_stats',
+    query: `CREATE TABLE IF NOT EXISTS ad_stats (
+        id SERIAL PRIMARY KEY,
+        ad_id INTEGER NOT NULL,
+        type VARCHAR(20) NOT NULL,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'route_seo_metadata',
+    query: `CREATE TABLE IF NOT EXISTS route_seo_metadata (
+        route_path VARCHAR(255) PRIMARY KEY,
+        title_ar TEXT,
+        title_en TEXT,
+        description_ar TEXT,
+        description_en TEXT,
+        og_image_url TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'seo_metadata',
+    query: `CREATE TABLE IF NOT EXISTS seo_metadata (
+        id SERIAL PRIMARY KEY,
+        route_path VARCHAR(255) UNIQUE NOT NULL,
+        entity_type VARCHAR(50),
+        entity_id VARCHAR(100),
+        title_en VARCHAR(255),
+        title_ar VARCHAR(255),
+        description_en TEXT,
+        description_ar TEXT,
+        og_image_url TEXT,
+        og_image_alt_en TEXT,
+        og_image_alt_ar TEXT,
+        keywords_en TEXT,
+        keywords_ar TEXT,
+        canonical_url TEXT,
+        structured_data JSONB DEFAULT '{}',
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'db_connections_registry',
+    query: `CREATE TABLE IF NOT EXISTS db_connections_registry (
+        id VARCHAR(50) PRIMARY KEY,
+        provider VARCHAR(50) DEFAULT 'postgresql',
+        type VARCHAR(50) DEFAULT 'core',
+        host VARCHAR(255),
+        port INTEGER DEFAULT 5432,
+        db_name VARCHAR(255),
+        username VARCHAR(255),
+        password TEXT,
+        connection_string TEXT,
+        ssl_mode VARCHAR(50) DEFAULT 'require',
+        pool_size INTEGER DEFAULT 10,
+        is_active BOOLEAN DEFAULT true,
+        status VARCHAR(50) DEFAULT 'healthy',
+        last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'gpu_providers',
+    query: `CREATE TABLE IF NOT EXISTS gpu_providers (
+        id SERIAL PRIMARY KEY,
+        provider_id VARCHAR(100) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        provider_type VARCHAR(100) NOT NULL,
+        endpoint_id VARCHAR(150),
+        base_url TEXT NOT NULL,
+        api_url TEXT,
+        encrypted_api_key TEXT NOT NULL,
+        current_load_capacity INTEGER DEFAULT 100,
+        status VARCHAR(50) DEFAULT 'active',
+        metadata JSONB DEFAULT '{}',
+        health_status VARCHAR(50) DEFAULT 'offline',
+        latency_ms INTEGER DEFAULT 0,
+        capabilities TEXT[] DEFAULT ARRAY['vision']::TEXT[],
+        daily_budget NUMERIC(15, 4) DEFAULT '0',
+        used_today NUMERIC(15, 4) DEFAULT '0',
+        last_reset_date DATE DEFAULT CURRENT_DATE,
+        config JSONB DEFAULT '{}',
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'gpu_provider_models',
+    query: `CREATE TABLE IF NOT EXISTS gpu_provider_models (
+        id SERIAL PRIMARY KEY,
+        provider_id INTEGER NOT NULL REFERENCES gpu_providers(id) ON DELETE CASCADE,
+        model_id VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        task_type VARCHAR(100) NOT NULL,
+        context_window INTEGER DEFAULT 32768,
+        max_output_tokens INTEGER DEFAULT 8192,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'gpu_execution_jobs',
+    query: `CREATE TABLE IF NOT EXISTS gpu_execution_jobs (
+        id SERIAL PRIMARY KEY,
+        job_id VARCHAR(120) UNIQUE NOT NULL,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        provider_id INTEGER REFERENCES gpu_providers(id) ON DELETE SET NULL,
+        model_id VARCHAR(255) NOT NULL,
+        task_type VARCHAR(100) NOT NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'pending',
+        prompt TEXT,
+        parameters JSONB DEFAULT '{}',
+        remote_job_id VARCHAR(255),
+        result_url TEXT,
+        result_data JSONB DEFAULT '{}',
+        latency_ms INTEGER DEFAULT 0,
+        error_message TEXT,
+        attempts INTEGER DEFAULT 1,
+        failover_count INTEGER DEFAULT 0,
+        cost_charged NUMERIC(15, 4) DEFAULT '0',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP
+      )`
+  },
+  {
+    name: 'push_tokens',
+    query: `CREATE TABLE IF NOT EXISTS push_tokens (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        platform VARCHAR(10) NOT NULL CHECK (platform IN ('android', 'ios')),
+        token TEXT NOT NULL UNIQUE,
+        device_name TEXT,
+        app_version TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        is_active BOOLEAN DEFAULT true
+    )`
+  },
+  {
+    name: 'api_performance_logs',
+    query: `CREATE TABLE IF NOT EXISTS api_performance_logs (
+        id SERIAL PRIMARY KEY,
+        endpoint VARCHAR(255) NOT NULL,
+        method VARCHAR(20) NOT NULL,
+        status_code INTEGER NOT NULL,
+        duration_ms NUMERIC(10, 2) NOT NULL,
+        ip_address VARCHAR(100),
+        user_agent TEXT,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        query_params JSONB DEFAULT '{}',
+        headers_snapshot JSONB DEFAULT '{}',
+        is_slow BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'forms',
+    query: `CREATE TABLE IF NOT EXISTS forms (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) UNIQUE,
+        description TEXT,
+        fields JSONB DEFAULT '[]',
+        settings JSONB DEFAULT '{}',
+        status VARCHAR(50) DEFAULT 'published',
+        submissions_count INTEGER DEFAULT 0,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'form_submissions',
+    query: `CREATE TABLE IF NOT EXISTS form_submissions (
+        id SERIAL PRIMARY KEY,
+        form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        data JSONB NOT NULL DEFAULT '{}',
+        ip_address VARCHAR(100),
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'map_providers',
+    query: `CREATE TABLE IF NOT EXISTS map_providers (
+        id SERIAL PRIMARY KEY,
+        provider_key VARCHAR(100) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        api_key_encrypted TEXT,
+        is_enabled BOOLEAN DEFAULT true,
+        is_primary BOOLEAN DEFAULT false,
+        priority INTEGER DEFAULT 1,
+        capabilities JSONB DEFAULT '[]',
+        config JSONB DEFAULT '{}',
+        status VARCHAR(50) DEFAULT 'untested',
+        last_tested_at TIMESTAMP,
+        last_error TEXT,
+        latency_ms INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'cached_locations',
+    query: `CREATE TABLE IF NOT EXISTS cached_locations (
+        id SERIAL PRIMARY KEY,
+        place_id VARCHAR(255),
+        title VARCHAR(255) NOT NULL,
+        city VARCHAR(255) NOT NULL,
+        state VARCHAR(255),
+        country VARCHAR(255),
+        country_code VARCHAR(10),
+        lat NUMERIC(10, 7),
+        lon NUMERIC(10, 7),
+        full_address TEXT,
+        category_label VARCHAR(100),
+        raw_type VARCHAR(100),
+        flag VARCHAR(20),
+        source VARCHAR(100) DEFAULT 'user_sync',
+        hits INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'studio_workspaces',
+    query: `CREATE TABLE IF NOT EXISTS studio_workspaces (
+        id VARCHAR(255) PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        framework_mode VARCHAR(50) DEFAULT 'html',
+        files JSONB DEFAULT '{}',
+        chat_history JSONB DEFAULT '[]',
+        is_public BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'studio_snapshots',
+    query: `CREATE TABLE IF NOT EXISTS studio_snapshots (
+        id SERIAL PRIMARY KEY,
+        workspace_id VARCHAR(255) REFERENCES studio_workspaces(id) ON DELETE CASCADE,
+        version_name VARCHAR(255) NOT NULL,
+        files JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'rinex_creators',
+    query: `CREATE TABLE IF NOT EXISTS rinex_creators (
+        id VARCHAR(100) PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        role_ar VARCHAR(255),
+        role_en VARCHAR(255),
+        avatar VARCHAR(500),
+        bio_ar TEXT,
+        bio_en TEXT,
+        verified BOOLEAN DEFAULT TRUE,
+        total_views INTEGER DEFAULT 0,
+        total_uses INTEGER DEFAULT 0,
+        rating DECIMAL(3,2) DEFAULT 5.0,
+        earnings_balance DECIMAL(20,4) DEFAULT 0.00,
+        followers_count INTEGER DEFAULT 0,
+        likes_count INTEGER DEFAULT 0,
+        profile_visits_count INTEGER DEFAULT 0,
+        social_links JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  },
+  {
+    name: 'rinex_templates',
+    query: `CREATE TABLE IF NOT EXISTS rinex_templates (
+        id VARCHAR(100) PRIMARY KEY,
+        creator_id VARCHAR(100) NOT NULL REFERENCES rinex_creators(id) ON DELETE CASCADE,
+        creator_name VARCHAR(255) NOT NULL,
+        creator_username VARCHAR(100) NOT NULL,
+        creator_avatar VARCHAR(500),
+        title_ar VARCHAR(255) NOT NULL,
+        title_en VARCHAR(255) NOT NULL,
+        description_ar TEXT,
+        description_en TEXT,
+        thumbnail TEXT,
+        canvas_background TEXT,
+        category VARCHAR(50) NOT NULL,
+        category_label_ar VARCHAR(100),
+        dimensions VARCHAR(50),
+        price_type VARCHAR(20) DEFAULT 'free',
+        price DECIMAL(10,2) DEFAULT 0.00,
+        views_count INTEGER DEFAULT 0,
+        uses_count INTEGER DEFAULT 0,
+        rating DECIMAL(3,2) DEFAULT 5.0,
+        elements JSONB DEFAULT '[]',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+  }
+];
+
+export async function applyCoreColumnEnforcements(targetPool: QueryClient) {
+  // === 1. Core DB Column Enforcement (Before Indexes/FKs) ===
+  await ensureColumnsBulk(targetPool, 'users', {
+    email_notifications: { type: 'BOOLEAN', default: 'true' },
+    avatar: { type: 'TEXT' },
+    referral_code: { type: 'VARCHAR(6)' },
+    provider: { type: 'VARCHAR(50)', default: 'local' },
+    kyc_status: { type: 'VARCHAR(50)', default: 'none' },
+    kyc_required: { type: 'BOOLEAN', default: false },
+    kyc_rejection_reason: { type: 'TEXT' },
+    kyc_submitted_at: { type: 'TIMESTAMP' },
+    avatar_asset_id: { type: 'UUID' },
+    media_muted: { type: 'BOOLEAN', default: 'true' },
+    data_saver: { type: 'BOOLEAN', default: 'false' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'chats', {
+    tool: { type: 'VARCHAR(50)', default: 'chat_fast' },
+    tool_id: { type: 'VARCHAR(50)', default: 'chat_fast' },
+    context_summary: { type: 'TEXT' },
+    is_pinned: { type: 'BOOLEAN', default: false }
+  });
+
+  await ensureColumnsBulk(targetPool, 'messages', {
+    tool: { type: 'VARCHAR(50)', default: 'chat_fast' },
+    tool_id: { type: 'VARCHAR(50)', default: 'chat_fast' },
+    model: { type: 'VARCHAR(100)' },
+    feedback: { type: 'VARCHAR(20)' },
+    thinking_steps: { type: 'JSONB' },
+    citations: { type: 'JSONB' },
+    follow_ups: { type: 'JSONB' },
+    generation_time: { type: 'INTEGER', default: 0 },
+    is_pinned: { type: 'BOOLEAN', default: false },
+    tokens_used: { type: 'INTEGER', default: 0 }
+  });
+
+  await ensureColumnsBulk(targetPool, 'api_keys_vault', {
+    url_key: { type: 'VARCHAR(255)' },
+    protocol_config: { type: 'JSONB', default: "'{}'" },
+    models: { type: 'JSONB', default: "'[]'" },
+    model_list: { type: 'JSONB', default: "'[]'" },
+    is_active: { type: 'BOOLEAN', default: true }
+  });
+
+  await ensureColumnsBulk(targetPool, 'tool_orchestrator', {
+    task_description: { type: 'TEXT' },
+    task_description_ar: { type: 'TEXT' },
+    fallback_1_provider: { type: 'VARCHAR(50)' },
+    fallback_1_model: { type: 'VARCHAR(100)' },
+    fallback_2_provider: { type: 'VARCHAR(50)' },
+    fallback_2_model: { type: 'VARCHAR(100)' },
+    fallback_3_provider: { type: 'VARCHAR(50)' },
+    fallback_3_model: { type: 'VARCHAR(100)' },
+    timeout_seconds: { type: 'INTEGER', default: 60 },
+    custom_headers: { type: 'JSONB', default: "'{}'" },
+    pricing_rule: { type: 'JSONB', default: "'{}'" }
+  });
+
+  await ensureColumnsBulk(targetPool, 'subscriptions', {
+    plan_type: { type: 'VARCHAR(50)', default: "'user'" },
+    price: { type: 'DECIMAL(10,2)', default: 0 },
+    limits: { type: 'JSONB', default: "'{}'" }
+  });
+
+  await ensureColumnsBulk(targetPool, 'user_files', {
+    extracted_text: { type: 'TEXT' },
+    is_active: { type: 'BOOLEAN', default: true },
+    token_count: { type: 'INTEGER', default: 0 },
+    category: { type: 'VARCHAR(50)', default: "'document'" },
+    tags: { type: 'TEXT[]', default: "'{}'" },
+    uploaded_by_role: { type: 'VARCHAR(50)', default: "'user'" },
+    file_data: { type: 'BYTEA' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'system_settings', {
+    site_name_en: { type: 'VARCHAR(255)', default: 'Perplexta' },
+    site_name_ar: { type: 'VARCHAR(255)', default: 'بيربليكستا' },
+    description_en: { type: 'TEXT' },
+    description_ar: { type: 'TEXT' },
+    logo_url: { type: 'TEXT' },
+    theme: { type: 'VARCHAR(20)', default: "'light'" },
+    default_language: { type: 'VARCHAR(10)', default: "'en'" },
+    maintenance_mode: { type: 'BOOLEAN', default: false },
+    allow_registrations: { type: 'BOOLEAN', default: true },
+    security_config: { type: 'JSONB', default: "'{}'" },
+    support_email: { type: 'VARCHAR(255)' },
+    social_links: { type: 'JSONB', default: "'{}'" },
+    custom_css: { type: 'TEXT' },
+    custom_js: { type: 'TEXT' },
+    seo_keywords: { type: 'TEXT' },
+    seo_description: { type: 'TEXT' },
+    analytics_code: { type: 'TEXT' },
+    terms_content: { type: 'TEXT' },
+    privacy_content: { type: 'TEXT' },
+    smtp_config: { type: 'JSONB', default: "'{}'" },
+    enable_crypto_payments: { type: 'BOOLEAN', default: false },
+    enable_stripe_payments: { type: 'BOOLEAN', default: true },
+    min_deposit_amount: { type: 'DECIMAL(10,2)', default: 10 },
+    max_deposit_amount: { type: 'DECIMAL(10,2)', default: 10000 },
+    referral_reward_amount: { type: 'DECIMAL(10,2)', default: 5 },
+    media_muted_default: { type: 'BOOLEAN', default: 'true' },
+    google_client_id: { type: 'VARCHAR(255)' },
+    google_client_secret: { type: 'TEXT' },
+    github_client_id: { type: 'VARCHAR(255)' },
+    github_client_secret: { type: 'TEXT' },
+    apple_client_id: { type: 'VARCHAR(255)' },
+    apple_team_id: { type: 'VARCHAR(255)' },
+    apple_key_id: { type: 'VARCHAR(255)' },
+    apple_private_key: { type: 'TEXT' },
+    microsoft_client_id: { type: 'VARCHAR(255)' },
+    microsoft_client_secret: { type: 'TEXT' },
+    oauth_providers_config: { type: 'JSONB', default: "'{}'" },
+    firebase_project_id: { type: 'VARCHAR(255)' },
+    firebase_client_email: { type: 'VARCHAR(255)' },
+    firebase_private_key: { type: 'TEXT' },
+    firebase_service_account_path: { type: 'TEXT' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_ads', {
+    view_count: { type: 'INTEGER', default: 0 },
+    click_count: { type: 'INTEGER', default: 0 },
+    is_featured: { type: 'BOOLEAN', default: false },
+    is_pinned: { type: 'BOOLEAN', default: false },
+    priority: { type: 'INTEGER', default: 0 },
+    page_id: { type: 'INTEGER' },
+    target_url: { type: 'TEXT' },
+    badge_text: { type: 'VARCHAR(100)' },
+    cta_label: { type: 'VARCHAR(100)' },
+    cta_action: { type: 'VARCHAR(50)' },
+    cta_payload: { type: 'TEXT' },
+    cta_style: { type: 'VARCHAR(50)' },
+    badge_color: { type: 'VARCHAR(50)' },
+    aspect_ratio: { type: 'VARCHAR(50)', default: "'16:9'" },
+    tags: { type: 'TEXT[]', default: "'{}'" },
+    metadata: { type: 'JSONB', default: "'{}'" },
+    media_urls: { type: 'JSONB', default: "'[]'" },
+    post_code: { type: 'VARCHAR(50)' },
+    author_username: { type: 'VARCHAR(100)' },
+    meta_title_en: { type: 'VARCHAR(255)' },
+    meta_title_ar: { type: 'VARCHAR(255)' },
+    meta_description_en: { type: 'TEXT' },
+    meta_description_ar: { type: 'TEXT' },
+    keywords_en: { type: 'TEXT' },
+    keywords_ar: { type: 'TEXT' },
+    og_image_url: { type: 'TEXT' },
+    who_can_comment: { type: 'VARCHAR(50)', default: "'anyone'" },
+    allow_translation: { type: 'BOOLEAN', default: true },
+    partnership_code: { type: 'VARCHAR(100)' },
+    is_partnership: { type: 'BOOLEAN', default: false },
+    partnership_brand: { type: 'VARCHAR(255)' },
+    audio_url: { type: 'TEXT' },
+    audio_title: { type: 'VARCHAR(255)' },
+    audio_artist: { type: 'VARCHAR(255)' },
+    audio_track_id: { type: 'VARCHAR(100)' },
+    deleted_at: { type: 'TIMESTAMP' },
+    archived_at: { type: 'TIMESTAMP' },
+    boost_goal: { type: 'VARCHAR(100)', default: "'whatsapp_leads'" },
+    boost_daily_budget: { type: 'NUMERIC(10,2)', default: 2.00 },
+    boost_settings: { type: 'JSONB', default: "'{}'" },
+    location_city: { type: 'VARCHAR(100)', default: "'فلسطين'" },
+    phone_number: { type: 'VARCHAR(50)' },
+    video_url: { type: 'TEXT' },
+    is_boosted: { type: 'BOOLEAN', default: false },
+    boosted_until: { type: 'TIMESTAMP' },
+    boost_tier: { type: 'VARCHAR(50)' },
+    boost_price: { type: 'NUMERIC(10,2)', default: 0 },
+    audience: { type: 'VARCHAR(50)', default: "'public'" },
+    ad_format: { type: 'VARCHAR(50)', default: "'post'" },
+    feeling: { type: 'VARCHAR(100)' },
+    tagged_users: { type: 'JSONB', default: "'[]'" },
+    is_ai_generated: { type: 'BOOLEAN', default: false },
+    has_whatsapp_button: { type: 'BOOLEAN', default: false },
+    whatsapp_number: { type: 'VARCHAR(50)' },
+    likes_count: { type: 'INTEGER', default: 0 },
+    comments_count: { type: 'INTEGER', default: 0 },
+    shares_count: { type: 'INTEGER', default: 0 },
+    clicks_count: { type: 'INTEGER', default: 0 },
+    impressions_count: { type: 'INTEGER', default: 0 }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_pages', {
+    view_count: { type: 'INTEGER', default: 0 },
+    followers_count: { type: 'INTEGER', default: 0 },
+    rating: { type: 'DECIMAL(3,2)', default: 5.0 },
+    review_count: { type: 'INTEGER', default: 0 },
+    is_verified: { type: 'BOOLEAN', default: false },
+    is_featured: { type: 'BOOLEAN', default: false },
+    managers: { type: 'JSONB', default: "'[]'" },
+    social_links: { type: 'JSONB', default: "'{}'" },
+    custom_sections: { type: 'JSONB', default: "'[]'" }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_ad_comments', {
+    parent_id: { type: 'INTEGER' },
+    like_count: { type: 'INTEGER', default: 0 },
+    is_pinned: { type: 'BOOLEAN', default: false }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_comment_likes', {
+    comment_id: { type: 'INTEGER' },
+    user_id: { type: 'INTEGER' },
+    reaction: { type: 'VARCHAR(20)', default: `'like'` }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_ad_likes', {
+    user_id: { type: 'INTEGER' },
+    ad_id: { type: 'INTEGER' },
+    reaction: { type: 'VARCHAR(20)', default: `'like'` }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_page_followers', {
+    user_id: { type: 'INTEGER' },
+    page_id: { type: 'INTEGER' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_page_inquiries', {
+    user_id: { type: 'INTEGER' },
+    page_id: { type: 'INTEGER' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'bulletin_saved_ads', {
+    user_id: { type: 'INTEGER' },
+    ad_id: { type: 'INTEGER' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'route_seo_settings', {
+    route_path: { type: 'VARCHAR(255)' },
+    title_en: { type: 'VARCHAR(255)' },
+    title_ar: { type: 'VARCHAR(255)' },
+    description_en: { type: 'TEXT' },
+    description_ar: { type: 'TEXT' },
+    keywords_en: { type: 'TEXT' },
+    keywords_ar: { type: 'TEXT' },
+    og_image: { type: 'TEXT' },
+    canonical_url: { type: 'TEXT' },
+    structured_data: { type: 'JSONB', default: "'{}'" },
+    is_active: { type: 'BOOLEAN', default: true }
+  });
+
+  await ensureColumnsBulk(targetPool, 'asset_metadata', {
+    asset_id: { type: 'VARCHAR(255)' },
+    file_type: { type: 'VARCHAR(50)' },
+    mime_type: { type: 'VARCHAR(100)' },
+    byte_size: { type: 'BIGINT', default: 0 },
+    dimensions: { type: 'JSONB', default: "'{}'" },
+    storage_provider: { type: 'VARCHAR(50)', default: "'local'" },
+    storage_path: { type: 'TEXT' },
+    public_url: { type: 'TEXT' },
+    checksum_sha256: { type: 'VARCHAR(64)' },
+    tags: { type: 'TEXT[]', default: "'{}'" },
+    metadata: { type: 'JSONB', default: "'{}'" }
+  });
+
+  await ensureColumnsBulk(targetPool, 'map_providers', {
+    api_key_encrypted: { type: 'TEXT' },
+    is_enabled: { type: 'BOOLEAN', default: true },
+    is_primary: { type: 'BOOLEAN', default: false },
+    priority: { type: 'INTEGER', default: 1 },
+    capabilities: { type: 'JSONB', default: "'[]'" },
+    config: { type: 'JSONB', default: "'{}'" },
+    status: { type: 'VARCHAR(50)', default: "'untested'" },
+    latency_ms: { type: 'INTEGER' },
+    last_error: { type: 'TEXT' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'cached_locations', {
+    place_id: { type: 'VARCHAR(255)' },
+    title: { type: 'VARCHAR(255)' },
+    city: { type: 'VARCHAR(255)' },
+    state: { type: 'VARCHAR(255)' },
+    country: { type: 'VARCHAR(255)' },
+    country_code: { type: 'VARCHAR(10)' },
+    lat: { type: 'NUMERIC(10, 7)' },
+    lon: { type: 'NUMERIC(10, 7)' },
+    full_address: { type: 'TEXT' },
+    category_label: { type: 'VARCHAR(100)' },
+    raw_type: { type: 'VARCHAR(100)' },
+    flag: { type: 'VARCHAR(20)' },
+    source: { type: 'VARCHAR(100)', default: "'user_sync'" },
+    hits: { type: 'INTEGER', default: 1 }
+  });
+
+  await ensureColumnsBulk(targetPool, 'user_activity_logs', {
+    user_id: { type: 'INTEGER' },
+    activity_type: { type: 'VARCHAR(50)' },
+    description: { type: 'TEXT' },
+    ip_address: { type: 'VARCHAR(45)' },
+    user_agent: { type: 'TEXT' },
+    metadata: { type: 'JSONB', default: "'{}'" }
+  });
+
+  await ensureColumnsBulk(targetPool, 'advertisements', {
+    format: { type: 'VARCHAR(20)', default: "'landscape'" },
+    target_pages: { type: 'TEXT[]', default: "'{}'" },
+    image_asset_id: { type: 'UUID' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'system_broadcasts', {
+    target_roles: { type: 'TEXT[]', default: "'{}'" },
+    priority: { type: 'VARCHAR(20)', default: "'medium'" },
+    action_url: { type: 'TEXT' },
+    action_label: { type: 'VARCHAR(100)' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'notifications', {
+    is_read: { type: 'BOOLEAN', default: false },
+    type: { type: 'VARCHAR(50)', default: 'system' },
+    metadata: { type: 'JSONB', default: "'{}'" },
+    action_url: { type: 'TEXT' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'plans', {
+    plan_type: { type: 'VARCHAR(50)', default: 'user' },
+    limits: { type: 'JSONB', default: "'{}'" },
+    features: { type: 'JSONB', default: "'[]'" },
+    hide_tools: { type: 'BOOLEAN', default: 'false' },
+    color: { type: 'VARCHAR(20)', default: '#3b82f6' },
+    badge: { type: 'VARCHAR(50)' },
+    is_popular: { type: 'BOOLEAN', default: false },
+    daily_credits: { type: 'INTEGER', default: 0 },
+    monthly_credits: { type: 'INTEGER', default: 0 },
+    annual_credits: { type: 'INTEGER', default: 0 }
+  });
+
+  await ensureColumnsBulk(targetPool, 'subscriptions', {
+    cycle_credits: { type: 'INTEGER', default: 0 },
+    used_credits: { type: 'INTEGER', default: 0 },
+    last_reset_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'video_resources', {
+    storage_provider: { type: 'VARCHAR(50)', default: "'local'" },
+    video_codec: { type: 'VARCHAR(50)' },
+    audio_codec: { type: 'VARCHAR(50)' },
+    bitrate_kbps: { type: 'INTEGER', default: 0 },
+    fps: { type: 'DECIMAL(5,2)', default: 0 },
+    aspect_ratio: { type: 'VARCHAR(20)' },
+    has_subtitles: { type: 'BOOLEAN', default: false },
+    is_processed: { type: 'BOOLEAN', default: false },
+    transcode_status: { type: 'VARCHAR(50)', default: "'pending'" },
+    error_log: { type: 'TEXT' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'model_cost_audit_logs', {
+    id: { type: 'SERIAL' },
+    user_id: { type: 'INTEGER' },
+    tool_id: { type: 'VARCHAR(50)' },
+    provider: { type: 'VARCHAR(50)' },
+    model: { type: 'VARCHAR(100)' },
+    prompt_tokens: { type: 'INTEGER', default: 0 },
+    completion_tokens: { type: 'INTEGER', default: 0 },
+    total_tokens: { type: 'INTEGER', default: 0 },
+    cost_usd: { type: 'DECIMAL(10, 6)', default: 0 },
+    cost_credits: { type: 'INTEGER', default: 0 },
+    status: { type: 'VARCHAR(50)', default: "'success'" },
+    error_message: { type: 'TEXT' },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'user_sessions', {
+    id: { type: 'SERIAL' },
+    user_id: { type: 'INTEGER' },
+    session_token: { type: 'TEXT' },
+    ip_address: { type: 'VARCHAR(100)' },
+    user_agent: { type: 'TEXT' },
+    status: { type: 'VARCHAR(20)', default: "'active'" },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    expires_at: { type: 'TIMESTAMP' },
+    last_active_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'admin_approval_queue', {
+    id: { type: 'SERIAL' },
+    requester_id: { type: 'INTEGER' },
+    action_type: { type: 'VARCHAR(100)' },
+    payload: { type: 'JSONB', default: "'{}'" },
+    status: { type: 'VARCHAR(20)', default: "'pending'" },
+    verification_code: { type: 'VARCHAR(10)' },
+    approver_id: { type: 'INTEGER' },
+    rejection_reason: { type: 'TEXT' },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'ad_pricing_audit', {
+    id: { type: 'SERIAL' },
+    admin_id: { type: 'INTEGER' },
+    field_name: { type: 'VARCHAR(100)' },
+    old_value: { type: 'NUMERIC(10,4)' },
+    new_value: { type: 'NUMERIC(10,4)' },
+    change_type: { type: 'VARCHAR(50)', default: "'manual'" },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'ad_stats', {
+    id: { type: 'SERIAL' },
+    ad_id: { type: 'INTEGER' },
+    type: { type: 'VARCHAR(20)' },
+    ip_address: { type: 'VARCHAR(45)' },
+    user_agent: { type: 'TEXT' },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'route_seo_metadata', {
+    route_path: { type: 'VARCHAR(255)' },
+    title_ar: { type: 'TEXT' },
+    title_en: { type: 'TEXT' },
+    description_ar: { type: 'TEXT' },
+    description_en: { type: 'TEXT' },
+    og_image_url: { type: 'TEXT' },
+    updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'seo_metadata', {
+    route_path: { type: 'VARCHAR(255)' },
+    entity_type: { type: 'VARCHAR(50)' },
+    entity_id: { type: 'VARCHAR(100)' },
+    title_en: { type: 'VARCHAR(255)' },
+    title_ar: { type: 'VARCHAR(255)' },
+    description_en: { type: 'TEXT' },
+    description_ar: { type: 'TEXT' },
+    og_image_url: { type: 'TEXT' },
+    og_image_alt_en: { type: 'TEXT' },
+    og_image_alt_ar: { type: 'TEXT' },
+    keywords_en: { type: 'TEXT' },
+    keywords_ar: { type: 'TEXT' },
+    canonical_url: { type: 'TEXT' },
+    structured_data: { type: 'JSONB', default: "'{}'" },
+    is_active: { type: 'BOOLEAN', default: true },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'support_tickets', {
+    status: { type: 'VARCHAR(50)', default: 'open' },
+    priority: { type: 'VARCHAR(50)', default: 'medium' },
+    category: { type: 'VARCHAR(50)', default: 'general' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'support_ticket_replies', {
+    is_internal: { type: 'BOOLEAN', default: false }
+  });
+
+  await ensureColumnsBulk(targetPool, 'db_connections_registry', {
+    id: { type: 'VARCHAR(50)' },
+    provider: { type: 'VARCHAR(50)', default: "'postgresql'" },
+    type: { type: 'VARCHAR(50)', default: "'core'" },
+    host: { type: 'VARCHAR(255)' },
+    port: { type: 'INTEGER', default: 5432 },
+    db_name: { type: 'VARCHAR(255)' },
+    username: { type: 'VARCHAR(255)' },
+    password: { type: 'TEXT' },
+    connection_string: { type: 'TEXT' },
+    ssl_mode: { type: 'VARCHAR(50)', default: "'require'" },
+    pool_size: { type: 'INTEGER', default: 10 },
+    is_active: { type: 'BOOLEAN', default: true },
+    status: { type: 'VARCHAR(50)', default: "'healthy'" },
+    last_checked_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'gpu_providers', {
+    provider_id: { type: 'VARCHAR(100)' },
+    name: { type: 'VARCHAR(255)' },
+    provider_type: { type: 'VARCHAR(100)' },
+    endpoint_id: { type: 'VARCHAR(150)' },
+    base_url: { type: 'TEXT' },
+    api_url: { type: 'TEXT' },
+    encrypted_api_key: { type: 'TEXT' },
+    current_load_capacity: { type: 'INTEGER', default: 100 },
+    status: { type: 'VARCHAR(50)', default: "'active'" },
+    metadata: { type: 'JSONB', default: "'{}'" },
+    health_status: { type: 'VARCHAR(50)', default: "'offline'" },
+    latency_ms: { type: 'INTEGER', default: 0 },
+    capabilities: { type: 'TEXT[]' },
+    daily_budget: { type: 'NUMERIC(15, 4)', default: 0 },
+    used_today: { type: 'NUMERIC(15, 4)', default: 0 },
+    last_reset_date: { type: 'DATE', default: 'CURRENT_DATE' },
+    config: { type: 'JSONB', default: "'{}'" },
+    is_active: { type: 'BOOLEAN', default: true },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'gpu_provider_models', {
+    provider_id: { type: 'INTEGER' },
+    model_id: { type: 'VARCHAR(255)' },
+    name: { type: 'VARCHAR(255)' },
+    task_type: { type: 'VARCHAR(100)' },
+    context_window: { type: 'INTEGER', default: 32768 },
+    max_output_tokens: { type: 'INTEGER', default: 4096 },
+    is_active: { type: 'BOOLEAN', default: true },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'gpu_execution_jobs', {
+    user_id: { type: 'INTEGER' },
+    provider_id: { type: 'INTEGER' },
+    model_id: { type: 'VARCHAR(255)' },
+    task_type: { type: 'VARCHAR(100)' },
+    status: { type: 'VARCHAR(50)', default: "'pending'" },
+    prompt: { type: 'TEXT' },
+    parameters: { type: 'JSONB', default: "'{}'" },
+    remote_job_id: { type: 'VARCHAR(255)' },
+    result_url: { type: 'TEXT' },
+    result_data: { type: 'JSONB', default: "'{}'" },
+    latency_ms: { type: 'INTEGER', default: 0 },
+    error_message: { type: 'TEXT' },
+    attempts: { type: 'INTEGER', default: 1 },
+    failover_count: { type: 'INTEGER', default: 0 },
+    cost_charged: { type: 'NUMERIC(15, 4)', default: 0 },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    completed_at: { type: 'TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'forms', {
+    title: { type: 'VARCHAR(255)' },
+    slug: { type: 'VARCHAR(255)' },
+    description: { type: 'TEXT' },
+    fields: { type: 'JSONB', default: "'[]'" },
+    settings: { type: 'JSONB', default: "'{}'" },
+    status: { type: 'VARCHAR(50)', default: "'published'" },
+    submissions_count: { type: 'INTEGER', default: 0 },
+    created_by: { type: 'INTEGER' },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' },
+    updated_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'form_submissions', {
+    form_id: { type: 'INTEGER' },
+    user_id: { type: 'INTEGER' },
+    data: { type: 'JSONB', default: "'{}'" },
+    ip_address: { type: 'VARCHAR(100)' },
+    user_agent: { type: 'TEXT' },
+    created_at: { type: 'TIMESTAMP', default: 'CURRENT_TIMESTAMP' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'studio_workspaces', {
+    description: { type: 'TEXT' },
+    framework_mode: { type: 'VARCHAR(50)', default: "'html'" },
+    files: { type: 'JSONB', default: "'{}'" },
+    chat_history: { type: 'JSONB', default: "'[]'" },
+    is_public: { type: 'BOOLEAN', default: false }
+  });
+
+  await ensureColumnsBulk(targetPool, 'studio_snapshots', {
+    files: { type: 'JSONB', default: "'{}'" },
+    version_name: { type: 'VARCHAR(255)' }
+  });
+
+  await ensureColumnsBulk(targetPool, 'rinex_creators', {
+    username: { type: 'VARCHAR(100)' },
+    name: { type: 'VARCHAR(255)' },
+    email: { type: 'VARCHAR(255)' },
+    role_ar: { type: 'VARCHAR(255)' },
+    role_en: { type: 'VARCHAR(255)' },
+    avatar: { type: 'VARCHAR(500)' },
+    bio_ar: { type: 'TEXT' },
+    bio_en: { type: 'TEXT' },
+    verified: { type: 'BOOLEAN', default: true },
+    total_views: { type: 'INTEGER', default: 0 },
+    total_uses: { type: 'INTEGER', default: 0 },
+    rating: { type: 'DECIMAL(3,2)', default: 5.0 },
+    earnings_balance: { type: 'DECIMAL(20,4)', default: 0.00 },
+    followers_count: { type: 'INTEGER', default: 0 },
+    likes_count: { type: 'INTEGER', default: 0 },
+    profile_visits_count: { type: 'INTEGER', default: 0 },
+    social_links: { type: 'JSONB', default: "'{}'" }
+  });
+
+  await ensureColumnsBulk(targetPool, 'rinex_templates', {
+    creator_id: { type: 'VARCHAR(100)' },
+    creator_name: { type: 'VARCHAR(255)' },
+    creator_username: { type: 'VARCHAR(100)' },
+    creator_avatar: { type: 'VARCHAR(500)' },
+    title_ar: { type: 'VARCHAR(255)' },
+    title_en: { type: 'VARCHAR(255)' },
+    description_ar: { type: 'TEXT' },
+    description_en: { type: 'TEXT' },
+    thumbnail: { type: 'TEXT' },
+    canvas_background: { type: 'TEXT' },
+    category: { type: 'VARCHAR(50)' },
+    category_label_ar: { type: 'VARCHAR(100)' },
+    dimensions: { type: 'VARCHAR(50)' },
+    price_type: { type: 'VARCHAR(20)', default: "'free'" },
+    price: { type: 'DECIMAL(10,2)', default: 0.00 },
+    views_count: { type: 'INTEGER', default: 0 },
+    uses_count: { type: 'INTEGER', default: 0 },
+    rating: { type: 'DECIMAL(3,2)', default: 5.0 },
+    elements: { type: 'JSONB', default: "'[]'" }
+  });
+
+  // === Migration: Data synchronization and unification of tool inside tool_id ===
+  try {
+    await targetPool.query(`
+      UPDATE chats 
+      SET tool_id = COALESCE(tool_id, tool, 'chat_fast'),
+          tool = COALESCE(tool, tool_id, 'chat_fast')
+      WHERE tool_id IS NULL OR tool IS NULL OR tool_id != tool;
+    `);
+    await targetPool.query(`
+      UPDATE messages 
+      SET tool_id = COALESCE(tool_id, tool, 'chat_fast'),
+          tool = COALESCE(tool, tool_id, 'chat_fast')
+      WHERE tool_id IS NULL OR tool IS NULL OR tool_id != tool;
+    `);
+  } catch (syncErr: any) {
+    console.warn('[Migrations] Warning synchronizing tool/tool_id columns:', syncErr?.message || syncErr);
+  }
+}
+
+export const CORE_INDEXES: string[] = [
+  `CREATE INDEX IF NOT EXISTS idx_studio_workspaces_user_id ON studio_workspaces(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_studio_workspaces_updated_at ON studio_workspaces(updated_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_studio_snapshots_workspace_id ON studio_snapshots(workspace_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_push_tokens_active ON push_tokens(is_active) WHERE is_active = true`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS forms_pkey ON forms(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS forms_slug_key ON forms(slug)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS form_submissions_pkey ON form_submissions(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_form_submissions_form_id ON form_submissions(form_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS referral_invitations_pkey ON referral_invitations(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_referral_invitations_referrer ON referral_invitations(referrer_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_referral_invitations_email ON referral_invitations(email)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS api_keys_vault_pkey ON api_keys_vault(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS api_keys_vault_provider_key ON api_keys_vault(provider)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS chat_memories_pkey ON chat_memories(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_chat_memories_user_id ON chat_memories(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_chat_memories_chat_id ON chat_memories(chat_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_chat_memories_user_id_created_at ON chat_memories(user_id, created_at DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS chats_pkey ON chats(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_chats_user_id ON chats(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_chats_user_id_updated_at ON chats(user_id, updated_at DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS db_connections_registry_pkey ON db_connections_registry(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS email_settings_pkey ON email_settings(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS email_templates_name_key ON email_templates(name)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS email_templates_pkey ON email_templates(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS message_reports_pkey ON message_reports(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_chat_created ON messages(chat_id, created_at DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS messages_pkey ON messages(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS notifications_pkey ON notifications(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS password_resets_pkey ON password_resets(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS plans_name_en_key ON plans(name_en)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS plans_pkey ON plans(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_pkey ON subscriptions(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_user_id_key ON subscriptions(user_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS support_ticket_replies_pkey ON support_ticket_replies(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_ticket_replies_ticket_id ON support_ticket_replies(ticket_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS support_tickets_pkey ON support_tickets(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS system_broadcasts_pkey ON system_broadcasts(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_system_logs_user_id ON system_logs(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_system_logs_created_at ON system_logs(created_at DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS system_logs_pkey ON system_logs(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS system_settings_pkey ON system_settings(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS oauth_states_pkey ON oauth_states(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS oauth_states_state_key ON oauth_states(state)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS tool_orchestrator_pkey ON tool_orchestrator(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS tool_orchestrator_tool_id_key ON tool_orchestrator(tool_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS user_files_pkey ON user_files(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_files_user_id ON user_files(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_files_chat_id ON user_files(chat_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_files_file_url ON user_files(file_url)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_files_created_at ON user_files(created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_activity_logs_user_id ON user_activity_logs(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_activity_logs_event_type ON user_activity_logs(event_type)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_activity_logs_created_at ON user_activity_logs(created_at DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS user_shortcuts_pkey ON user_shortcuts(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS user_usage_pkey ON user_usage(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS users_email_key ON users(email)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS users_pkey ON users(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS video_resources_pkey ON video_resources(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_video_resources_chat_id ON video_resources(chat_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_video_resources_user_id ON video_resources(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_users_avatar_asset_id ON users(avatar_asset_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_user_id ON bulletin_ads(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_page_id ON bulletin_ads(page_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_status ON bulletin_ads(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_ad_format ON bulletin_ads(ad_format)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_created_at ON bulletin_ads(created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_pages_user_id ON bulletin_pages(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_pages_category ON bulletin_pages(category)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ad_comments_ad_id ON bulletin_ad_comments(ad_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ad_likes_ad_user ON bulletin_ad_likes(ad_id, user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_page_followers_page_user ON bulletin_page_followers(page_id, user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_page_inquiries_page ON bulletin_page_inquiries(page_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_page_inquiries_sender ON bulletin_page_inquiries(sender_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_saved_ads_user_ad ON bulletin_saved_ads(user_id, ad_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions(session_token)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_sessions_expires_at ON user_sessions(expires_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_sessions_status ON user_sessions(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_model_cost_audit_user ON model_cost_audit_logs(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_model_cost_audit_tool ON model_cost_audit_logs(tool_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_model_cost_audit_created ON model_cost_audit_logs(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_approval_queue_status ON admin_approval_queue(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_approval_queue_requester ON admin_approval_queue(requester_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_ad_pricing_audit_admin_id ON ad_pricing_audit(admin_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_ad_pricing_audit_created_at ON ad_pricing_audit(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_ad_stats_ad_id ON ad_stats(ad_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_ad_stats_type ON ad_stats(type)`,
+  `CREATE INDEX IF NOT EXISTS idx_ad_stats_created_at ON ad_stats(created_at)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS seo_metadata_pkey ON seo_metadata(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS seo_metadata_route_path_key ON seo_metadata(route_path)`,
+  `CREATE INDEX IF NOT EXISTS idx_seo_metadata_entity ON seo_metadata(entity_type, entity_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS gpu_providers_pkey ON gpu_providers(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS gpu_providers_provider_id_key ON gpu_providers(provider_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_providers_status ON gpu_providers(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_providers_is_active ON gpu_providers(is_active)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS gpu_provider_models_pkey ON gpu_provider_models(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_provider_models_provider_id ON gpu_provider_models(provider_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_provider_models_task_type ON gpu_provider_models(task_type)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS gpu_execution_jobs_pkey ON gpu_execution_jobs(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS gpu_execution_jobs_job_id_key ON gpu_execution_jobs(job_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_execution_jobs_user_id ON gpu_execution_jobs(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_execution_jobs_provider_id ON gpu_execution_jobs(provider_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_execution_jobs_task_type ON gpu_execution_jobs(task_type)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_execution_jobs_status ON gpu_execution_jobs(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_gpu_execution_jobs_created_at ON gpu_execution_jobs(created_at DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS api_performance_logs_pkey ON api_performance_logs(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_api_performance_logs_created_at ON api_performance_logs(created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_api_performance_logs_duration ON api_performance_logs(duration_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_api_performance_logs_endpoint ON api_performance_logs(endpoint)`,
+  `CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_title_trgm ON bulletin_ads USING gin (title gin_trgm_ops)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_desc_trgm ON bulletin_ads USING gin (description gin_trgm_ops)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_hashtags_trgm ON bulletin_ads USING gin (hashtags gin_trgm_ops)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_category_trgm ON bulletin_ads USING gin (category gin_trgm_ops)`,
+  `CREATE INDEX IF NOT EXISTS idx_bulletin_ads_status_expires_created ON bulletin_ads(status, expires_at DESC, created_at DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS rinex_creators_pkey ON rinex_creators(id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS rinex_creators_username_key ON rinex_creators(username)`,
+  `CREATE INDEX IF NOT EXISTS idx_rinex_creators_email ON rinex_creators(email)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS rinex_templates_pkey ON rinex_templates(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_rinex_templates_creator_id ON rinex_templates(creator_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_rinex_templates_category ON rinex_templates(category)`
+];
+
+export const CORE_RELATIONS: ForeignKeyRelation[] = [
+  { table: 'chats', constraint: 'chats_user_id_fkey', column: 'user_id', ref: 'users' },
+  { table: 'messages', constraint: 'messages_chat_id_fkey', column: 'chat_id', ref: 'chats' },
+  { table: 'notifications', constraint: 'notifications_user_id_fkey', column: 'user_id', ref: 'users' },
+  { table: 'subscriptions', constraint: 'subscriptions_plan_id_fkey', column: 'plan_id', ref: 'plans', onDelete: 'SET NULL' },
+  { table: 'subscriptions', constraint: 'subscriptions_user_id_fkey', column: 'user_id', ref: 'users' },
+  { table: 'system_broadcasts', constraint: 'system_broadcasts_admin_id_fkey', column: 'admin_id', ref: 'users', onDelete: 'SET NULL' },
+  { table: 'user_files', constraint: 'user_files_chat_id_fkey', column: 'chat_id', ref: 'chats', onDelete: 'SET NULL' },
+  { table: 'user_files', constraint: 'user_files_user_id_fkey', column: 'user_id', ref: 'users' },
+  { table: 'users', constraint: 'users_referred_by_fkey', column: 'referred_by', ref: 'users', onDelete: 'SET NULL' },
+  { table: 'user_sessions', constraint: 'fk_user_sessions_user', column: 'user_id', ref: 'users', onDelete: 'CASCADE' },
+  { table: 'admin_approval_queue', constraint: 'fk_admin_approval_queue_requester', column: 'requester_id', ref: 'users', onDelete: 'CASCADE' },
+  { table: 'ad_pricing_audit', constraint: 'fk_ad_pricing_audit_admin', column: 'admin_id', ref: 'users', onDelete: 'CASCADE' },
+  { table: 'gpu_provider_models', constraint: 'fk_gpu_provider_models_provider', column: 'provider_id', ref: 'gpu_providers', onDelete: 'CASCADE' },
+  { table: 'gpu_execution_jobs', constraint: 'fk_gpu_execution_jobs_user', column: 'user_id', ref: 'users', onDelete: 'SET NULL' },
+  { table: 'gpu_execution_jobs', constraint: 'fk_gpu_execution_jobs_provider', column: 'provider_id', ref: 'gpu_providers', onDelete: 'SET NULL' },
+  { table: 'forms', constraint: 'fk_forms_created_by', column: 'created_by', ref: 'users', onDelete: 'SET NULL' },
+  { table: 'form_submissions', constraint: 'fk_form_submissions_form', column: 'form_id', ref: 'forms', onDelete: 'CASCADE' },
+  { table: 'studio_workspaces', constraint: 'fk_studio_workspaces_user', column: 'user_id', ref: 'users', onDelete: 'CASCADE' },
+  { table: 'studio_snapshots', constraint: 'fk_studio_snapshots_workspace', column: 'workspace_id', ref: 'studio_workspaces', onDelete: 'CASCADE' },
+  { table: 'rinex_templates', constraint: 'fk_rinex_templates_creator', column: 'creator_id', ref: 'rinex_creators', onDelete: 'CASCADE' }
+];
+
+export async function applyCoreRelations(targetPool: QueryClient) {
+  for (const rel of CORE_RELATIONS) {
+    await ensureForeignKey(targetPool, rel.table, rel.constraint, rel.column, rel.ref, rel.refColumn || 'id', rel.onDelete || 'CASCADE');
+  }
+}
+
+export async function seedCoreDatabase(targetPool: QueryClient, targetLedgerPool?: QueryClient) {
+  // System Settings Seed
+  const settingsCheck = await targetPool.query('SELECT count(*) FROM system_settings');
+  if (parseInt(settingsCheck.rows[0].count, 10) === 0) {
+    await targetPool.query(
+      `INSERT INTO system_settings (site_name_en, site_name_ar) VALUES ($1, $2)`,
+      ['Perplexta', 'بيربليكستا']
+    );
+  }
+
+  // Admin User Seed
+  const adminEmail = process.env.ADMIN_EMAIL || process.env.VITE_ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (!adminEmail || !adminPassword) {
+    throw new Error('FATAL CONFIGURATION ERROR: ADMIN_EMAIL and ADMIN_PASSWORD environment variables are required and must be configured in your env/environment file.');
+  }
+
+  const adminEmails = [adminEmail];
+  const defaultPassword = adminPassword;
+  let sharedHash: string | null = null;
+
+  for (const email of adminEmails) {
+    const adminCheck = await targetPool.query('SELECT * FROM users WHERE email = $1', [email]);
+
+    if (adminCheck.rows.length === 0) {
+      if (!sharedHash) sharedHash = await bcrypt.hash(defaultPassword, 10);
+      const newAdmin = await targetPool.query(
+        `INSERT INTO users (email, name, password_hash, role, status) VALUES ($1, $2, $3, 'admin', 'active') RETURNING id`,
+        [email, 'Master Admin', sharedHash]
+      );
+      const adminId = newAdmin.rows[0].id;
+      if (targetLedgerPool) {
+        await targetLedgerPool.query(
+          `INSERT INTO wallets (user_id, balance, points) VALUES ($1, 0.0000, 10000) ON CONFLICT (user_id) DO NOTHING`,
+          [adminId]
+        ).catch(() => {});
+      }
+      console.log(`[Seed] Seeded default admin account: ${email}`);
+    } else {
+      const user = adminCheck.rows[0];
+      if (user.role !== 'admin' || user.status !== 'active') {
+        await targetPool.query(`UPDATE users SET role = 'admin', status = 'active' WHERE email = $1`, [email]);
+      }
+      
+      if (process.env.ADMIN_PASSWORD) {
+        const isMatch = await bcrypt.compare(process.env.ADMIN_PASSWORD, user.password_hash);
+        if (!isMatch) {
+          if (!sharedHash) sharedHash = await bcrypt.hash(defaultPassword, 10);
+          console.log(`[Migrations] Force updating admin password for: ${email} to match environment configuration`);
+          await targetPool.query(
+            'UPDATE users SET password_hash = $1, role = $2, status = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4',
+            [sharedHash, 'admin', 'active', user.id]
+          );
+        }
+      }
+    }
+  }
+
+  // Plans Seed
+  const planCheck = await targetPool.query('SELECT count(*) FROM plans');
+  if (parseInt(planCheck.rows[0].count, 10) === 0) {
+    await targetPool.query(`
+      INSERT INTO plans (name_en, name_ar, desc_en, desc_ar, monthly_price, annual_price, discount, features, color, is_popular, badge, limits, plan_type)
+      VALUES
+        ('Starter', 'البداية', 'Free starter plan', 'خطة البداية المجانية', 0, 0, 0, '["Basic Search", "Limited AI Chats"]', '#334155', false, 'Standard', '{"chat": 20, "chat_fast": 30, "perplexta_analysis": 5, "image": 2, "code": 5, "sovereign_search": 10, "stt": 5, "tts": 5, "storage_mb": 100}', 'user'),
+        ('Pro', 'المحترف', 'Professional plan for advanced users', 'خطة المحترفين للمستخدمين المتقدمين', 19.99, 199.90, 17, '["Advanced Analysis", "Unlimited Chats", "Priority Support"]', '#3b82f6', true, 'Best Value', '{"chat": "unlimited", "chat_fast": "unlimited", "chat_pro": 100, "perplexta_analysis": 50, "image": 50, "code": 100, "sovereign_search": 100, "stt": 100, "tts": 100, "storage_mb": 1024}', 'user'),
+        ('Elite', 'النخبة', 'Full power for strategic expert users', 'القوة الكاملة للمستخدمين الخبراء الاستراتيجيين', 49.99, 499.90, 17, '["Full Perplexta Access", "Multi-model Orchestration", "Concierge Support"]', '#8b5cf6', false, 'Elite', '{"chat": "unlimited", "chat_fast": "unlimited", "chat_pro": "unlimited", "chat_reasoning": "unlimited", "perplexta_analysis": "unlimited", "image": "unlimited", "video": 50, "code": "unlimited", "ads_copilot": "unlimited", "storage_mb": 10240}', 'user')
+      ON CONFLICT (name_en) DO NOTHING
+    `);
+  }
+
+  const devPlanCheck = await targetPool.query("SELECT count(*) FROM plans WHERE plan_type = 'developer'");
+  if (parseInt(devPlanCheck.rows[0].count, 10) === 0) {
+    await targetPool.query(`
+      INSERT INTO plans (name_en, name_ar, desc_en, desc_ar, monthly_price, annual_price, discount, features, color, is_popular, badge, limits, plan_type)
+      VALUES
+        ('Developer Lite', 'مطور لايت', 'Direct high-fidelity x402 gateway and programmatic client connectivity.', 'بوابة x402 عالية الدقة المباشرة وربط العملاء البرمجيين.', 29.99, 299.90, 17, '["Direct x402 API Access", "1,000 Key Requests/day", "Unified Failover Route", "Rate limit 30 req/min"]', '#8b5cf6', false, 'Dev Entry', '{"x402_api": 1000, "storage_mb": 2000}', 'developer'),
+        ('Developer Scale', 'مطور سكيل', 'Unthrottled enterprise gateway and strategic multi-modal programmatic access.', 'بوابة المؤسسات غير المحدودة والوصول البرمجي المتعدد الاستراتيجي.', 99.99, 999.90, 17, '["Unthrottled x402 API Node", "10,000 Key Requests/day", "Dedicated Webhooks", "Automated Failover Orchestrator Mode", "Priority Support"]', '#ec4899', true, 'Best Dev Value', '{"x402_api": 10000, "storage_mb": 10240}', 'developer')
+      ON CONFLICT (name_en) DO NOTHING
+    `);
+  }
+
+  // Tool Orchestrator Seed
+  await targetPool.query(`
+    INSERT INTO tool_orchestrator (tool_id, primary_provider, primary_model, task_description, task_description_ar)
+    VALUES
+      ('chat_fast', '', '', 'High-speed technical intelligence agent for quick insights.', 'عميل ذكاء تقني سريع للاستفسارات الفورية.'),
+      ('chat_pro', '', '', 'Advanced perplexta reasoning engine for deep technical problem solving.', 'محرك استنتاج استراتيجي متقدم لحل المشكلات التقنية العميقة.'),
+      ('chat_reasoning', '', '', 'Complex multi-step reasoning protocol for high-stakes intelligence.', 'بروتوكول تفكير معقد متعدد الخطوات للمهام فائقة الأهمية.'),
+      ('perplexta_analysis', '', '', 'Perplexta Document, File & Vision Forensic Analysis Protocol.', 'استخراج وتدقيق المستندات والملفات والصور والمخططات.'),
+      ('image', '', '', 'High-precision visual synthesis engine for professional assets.', 'محرك توليد بصري عالي الدقة للأصول المهنية.'),
+      ('video', '', '', 'Global standard video generation and cinematic synthesis.', 'توليد فيديو بمعايير عالمية وتوليد سينمائي متقدم.'),
+      ('tts', '', '', 'Elite natural acoustic synthesis and voice engineering.', 'توليد صوتي طبيعي متطور وهندسة صوتية نخبوية.'),
+      ('stt', '', '', 'High-fidelity acoustic transcription and linguistic extraction.', 'تحويل صوتي عالي الدقة واستخراج لغوي متقن.'),
+      ('ads_copilot', '', '', 'Perplexta Ads & Growth Copilot for Meta, Google, TikTok, and ViralBook campaigns.', 'مساعد الإعلانات والنمو التجاري لمنصة فيرال بوك والمنصات العالمية.'),
+      ('code', '', '', 'Master-level software engineering workstation and logic constructor.', 'محطة عمل هندسة البرمجيات وبناء المنطق البرمجي المتقدم.'),
+      ('canvas', '', '', 'Perplexta creative studio and multi-modal design canvas.', 'استوديو الإبداع المتقدم ولوحة التصميم متعددة الوسائط.'),
+      ('sovereign_search', '', '', 'Perplexta Research & Studies Protocol for comprehensive academic literature synthesis.', 'منظومة البحوث والدراسات الأكاديمية والمراجعة المنهجية.'),
+      ('perplexta_music', '', '', 'Advanced acoustic composition and structural music synthesis.', 'التأليف الصوتي المتقدم والتركيب الموسيقي الهيكلي.'),
+      ('x402_api', '', '', 'Dynamic high-fidelity artificial intelligence analytics gateway for programmatic developer clients connected via x402 payment protocol.', 'بوابة تحليلات الذكاء الاصطناعي عالية الدقة الديناميكية لعملاء الوكلاء البرمجيين المتصلين ببروتوكول دفع x402.'),
+      ('vision', '', '', 'High-performance visual understanding, computer vision and multimodal document analysis.', 'نظام الرؤية الحاسوبية والفهم البصري المتقدم وتحليل الوثائق والصور.')
+    ON CONFLICT (tool_id) DO NOTHING
+  `);
+
+  await targetPool.query("DELETE FROM tool_orchestrator WHERE tool_id IN ('notebook', 'learning', 'legal_analysis', 'sovereign_memory')");
+
+  // Map Providers Seed
+  const mapCheck = await targetPool.query('SELECT count(*) FROM map_providers');
+  if (parseInt(mapCheck.rows[0].count, 10) === 0) {
+    await targetPool.query(`
+      INSERT INTO map_providers (provider_key, name, is_enabled, is_primary, priority, status, capabilities, config)
+      VALUES
+        (
+          'openstreetmap', 
+          'OpenStreetMap / Photon Engine (Zero-Cost Free Tier)', 
+          true, 
+          true, 
+          1, 
+          'free_tier',
+          '["places_autocomplete", "geocoding", "reverse_geocoding"]',
+          '{"portal_url": "https://photon.komoot.io/"}'
+        ),
+        (
+          'google_maps', 
+          'Google Maps Platform (Places & Geocoding APIs)', 
+          true, 
+          false, 
+          2, 
+          'untested',
+          '["places_autocomplete", "geocoding", "reverse_geocoding", "places_details", "vector_tiles"]',
+          '{"portal_url": "https://console.cloud.google.com/google/maps-apis/credentials"}'
+        ),
+        (
+          'mapbox', 
+          'Mapbox Search & Geocoding v5', 
+          false, 
+          false, 
+          3, 
+          'untested',
+          '["places_autocomplete", "geocoding", "reverse_geocoding", "vector_tiles"]',
+          '{"portal_url": "https://account.mapbox.com/access-tokens/"}'
+        ),
+        (
+          'locationiq', 
+          'LocationIQ Geocoding & Forward Search', 
+          false, 
+          false, 
+          4, 
+          'untested',
+          '["places_autocomplete", "geocoding", "reverse_geocoding"]',
+          '{"portal_url": "https://my.locationiq.com/dashboard#accesstoken"}'
+        )
+      ON CONFLICT (provider_key) DO NOTHING
+    `);
+  }
+}

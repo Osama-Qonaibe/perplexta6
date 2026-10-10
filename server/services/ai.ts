@@ -1,0 +1,1214 @@
+
+import { Agent as HttpAgent } from 'http';
+import { Agent as HttpsAgent } from 'https';
+
+const httpAgent = new HttpAgent({ keepAlive: true, timeout: 60000 });
+const httpsAgent = new HttpsAgent({ keepAlive: true, timeout: 60000 });
+
+// Override global fetch or specify dispatcher (for node-fetch or undici).
+// Note: native fetch in Node 18+ uses undici. We can pass a custom dispatcher.
+import { setGlobalDispatcher, Agent } from 'undici';
+if (typeof setGlobalDispatcher === 'function') {
+  setGlobalDispatcher(new Agent({ connections: 100, pipelining: 10, keepAliveTimeout: 60000, keepAliveMaxTimeout: 600000 }));
+}
+import fs from 'fs/promises';
+import path from 'path';
+import { existsSync, mkdirSync } from 'fs';
+import { pool } from '../db/index.js';
+import { decrypt, encrypt } from '../utils/crypto.js';
+import { memoryCache } from '../utils/cache.js';
+import { invalidateApiKeysVaultCache, invalidateOrchestratorConfigCache } from '../db/queries.js';
+
+const CUSTOM_PROVIDER_TIMEOUT_MS = 12000;
+
+function createTimeoutSignal(ms: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
+}
+
+async function handleApiError(response: Response, provider: string) {
+  if (!response.ok) {
+    let errorDetail = '';
+    try {
+      const data = await response.json();
+      errorDetail = JSON.stringify(data.error || data);
+    } catch (e) {
+      errorDetail = await response.text();
+    }
+    console.error(`[Orchestrator] ${provider} API Error (${response.status}): ${errorDetail.substring(0, 200)}`);
+    throw new Error(`Connection to ${provider} failed. Please check your API key and quota.`);
+  }
+}
+
+function cleanOllamaUrl(rawUrl: string): string {
+  let url = rawUrl.trim();
+  if (!url) return 'http://localhost:11434';
+  if (!url.startsWith('http')) {
+    url = `http://${url}`;
+  }
+  while (url.endsWith('/')) {
+    url = url.slice(0, -1);
+  }
+  if (url.endsWith('/api/chat')) {
+    url = url.slice(0, -9);
+  }
+  while (url.endsWith('/')) {
+    url = url.slice(0, -1);
+  }
+  if (url.endsWith('/api/tags')) {
+    url = url.slice(0, -9);
+  }
+  while (url.endsWith('/')) {
+    url = url.slice(0, -1);
+  }
+  if (url.endsWith('/api')) {
+    url = url.slice(0, -4);
+  }
+  while (url.endsWith('/')) {
+    url = url.slice(0, -1);
+  }
+  if (url.endsWith('/v1')) {
+    url = url.slice(0, -3);
+  }
+  while (url.endsWith('/')) {
+    url = url.slice(0, -1);
+  }
+  return url;
+}
+
+export async function syncProviderModelsInternal(providerId: string, apiKey: string, urlKey?: string) {
+  let keyToUse = apiKey ? apiKey.trim() : '';
+
+  // Ensure we strip the custom URL from the key if it was pre-pended during vault storage
+  if (urlKey && keyToUse.startsWith(urlKey)) {
+    keyToUse = keyToUse.substring(urlKey.length);
+    if (keyToUse.startsWith(':')) {
+      keyToUse = keyToUse.substring(1);
+    }
+  }
+
+  const cleanApiKey = keyToUse.trim();
+  const provider = providerId.toLowerCase();
+  let models: any[] = [];
+  let count = 0;
+
+  const { signal: timeoutSignal, clear: clearTimeoutTimer } = createTimeoutSignal(45000);
+
+  try {
+    if (provider === 'openai') {
+      const response = await fetch('https://api.openai.com/v1/models', {
+        headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'OpenAI');
+      const data: any = await response.json();
+      models = (data.data || []).map((m: any) => ({ ...m, name: m.id }));
+    } else if (provider === 'anthropic') {
+      const response = await fetch('https://api.anthropic.com/v1/models', {
+        headers: { 
+          'x-api-key': cleanApiKey, 
+          'anthropic-version': '2023-06-01',
+          'Accept': 'application/json'
+        },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'Anthropic');
+      const data: any = await response.json();
+      models = (data.data || []).map((m: any) => ({ ...m, name: m.id }));
+    } else if (provider === 'deepseek') {
+      const response = await fetch('https://api.deepseek.com/v1/models', {
+        headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'DeepSeek');
+      const data: any = await response.json();
+      models = (data.data || []).map((m: any) => ({ id: m.id, name: m.id }));
+    } else if (provider === 'google' || provider === 'gemini') {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models`, {
+        headers: { 
+          'Accept': 'application/json',
+          'x-goog-api-key': cleanApiKey
+        },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'Google AI');
+      const data: any = await response.json();
+      models = (data.models || [])
+        .map((m: any) => ({
+          ...m,
+          id: m.name,
+          name: m.displayName || m.name.replace('models/', ''),
+          supportedMethods: m.supportedGenerationMethods || []
+        }))
+        .sort((a: any, b: any) => {
+          const aSupports = (a.supportedMethods || []).includes('generateContent') ? 1 : 0;
+          const bSupports = (b.supportedMethods || []).includes('generateContent') ? 1 : 0;
+          if (bSupports !== aSupports) return bSupports - aSupports;
+          return (a.name || '').localeCompare(b.name || '');
+        });
+    } else if (provider === 'together') {
+      const response = await fetch('https://api.together.xyz/v1/models', {
+        headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'Together AI');
+      const data: any = await response.json();
+      models = (data || []).map((m: any) => ({ id: m.id, name: m.display_name || m.id }));
+    } else if (provider === 'openrouter') {
+      const response = await fetch('https://openrouter.ai/api/v1/models', {
+        headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'OpenRouter');
+      const data: any = await response.json();
+      models = (data.data || []).map((m: any) => ({ id: m.id, name: m.name || m.id }));
+    } else if (provider === 'xai' || provider === 'grok') {
+      const response = await fetch('https://api.x.ai/v1/models', {
+        headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'xAI');
+      const data: any = await response.json();
+      models = (data.data || []).map((m: any) => ({ id: m.id, name: m.id }));
+    } else if (provider === 'groq') {
+      const response = await fetch('https://api.groq.com/openai/v1/models', {
+        headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+        signal: timeoutSignal
+      });
+      await handleApiError(response, 'Groq');
+      const data: any = await response.json();
+      models = (data.data || []).map((m: any) => ({ id: m.id, name: m.id }));
+    } else if (provider.includes('ollama')) {
+        const cleanUrl = cleanOllamaUrl(urlKey || '');
+        const targetHeaders: any = { 'Accept': 'application/json' };
+        if (cleanApiKey && cleanApiKey.trim() !== '') {
+            targetHeaders['Authorization'] = `Bearer ${cleanApiKey}`;
+        }
+        const response = await fetch(`${cleanUrl}/api/tags`, {
+            headers: targetHeaders,
+            signal: timeoutSignal
+        });
+        await handleApiError(response, 'Ollama');
+        const data = await response.json();
+        models = (data.models || []).map((m: any) => ({ id: m.name, name: m.name }));
+    } else if (provider === 'mistral') {
+       const response = await fetch('https://api.mistral.ai/v1/models', {
+         headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+         signal: timeoutSignal
+       });
+       await handleApiError(response, 'Mistral AI');
+       const data: any = await response.json();
+       models = (data.data || []).map((m: any) => ({ id: m.id, name: m.id }));
+    } else if (provider === 'elevenlabs') {
+       const response = await fetch('https://api.elevenlabs.io/v1/models', {
+         headers: { 'xi-api-key': cleanApiKey, 'Accept': 'application/json' },
+         signal: timeoutSignal
+       });
+       await handleApiError(response, 'ElevenLabs');
+       const data: any = await response.json();
+       const modelsArray = Array.isArray(data) ? data : (data.data || []);
+       models = modelsArray.map((m: any) => ({ id: m.model_id || m.id, name: m.name || m.model_id || m.id }));
+    } else if (provider === 'serper') {
+        models = [
+            { id: 'google-serper', name: 'Google Serper Search Engine' }
+        ];
+    } else {
+        let baseUrl = urlKey;
+        if (!baseUrl) {
+            baseUrl = await getProviderUrlKey(provider) || undefined;
+        }
+        if (baseUrl) {
+            let cleanUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+            if (cleanUrl.endsWith('/chat/completions')) cleanUrl = cleanUrl.replace('/chat/completions', '');
+            else if (cleanUrl.endsWith('/models')) cleanUrl = cleanUrl.replace('/models', '');
+            else if (cleanUrl.endsWith('/api/chat')) cleanUrl = cleanUrl.replace('/api/chat', '');
+            
+            try {
+                let response = await fetch(`${cleanUrl}/models`, {
+                    headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+                    signal: timeoutSignal
+                });
+                
+                if (!response.ok && response.status === 404 && !cleanUrl.endsWith('/v1')) {
+                    response = await fetch(`${cleanUrl}/v1/models`, {
+                        headers: { 'Authorization': `Bearer ${cleanApiKey}`, 'Accept': 'application/json' },
+                        signal: timeoutSignal
+                    });
+                }
+
+                if (response.ok) {
+                    const data: any = await response.json();
+                    const modelsArray = Array.isArray(data) ? data : (data.data || []);
+                    models = modelsArray.map((m: any) => ({ 
+                        id: m.id || m.name || m.model, 
+                        name: m.name || m.id || m.model || 'Unknown Model' 
+                    })).filter((m: any) => m.id);
+                } else {
+                    console.warn(`[SyncCustom] Custom provider models fetch returned not ok (${response.status})`);
+                }
+            } catch (err) {
+                console.error(`[SyncCustom] Error fetching models from ${cleanUrl}:`, err);
+            }
+        }
+    }
+
+    // Deduplicate models strictly by unique model ID to ensure consistency and prevent duplicates
+    const seenModelIds = new Set<string>();
+    const uniqueModels: any[] = [];
+    for (const m of models) {
+      const modelId = typeof m === 'string' ? m : (m?.id || m?.name || '');
+      if (modelId && !seenModelIds.has(modelId)) {
+        seenModelIds.add(modelId);
+        const modelName = typeof m === 'string' ? m : (m?.name || m?.id || modelId);
+        uniqueModels.push(typeof m === 'string' ? { id: modelId, name: modelName } : { ...m, id: modelId, name: modelName });
+      }
+    }
+    models = uniqueModels;
+    count = models.length;
+
+    if (count > 0) {
+      await pool.query(
+        `INSERT INTO api_keys_vault (provider, encrypted_key, is_active, models, model_list, updated_at)
+         VALUES ($1, $2, true, $3, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT (provider) DO UPDATE
+         SET encrypted_key = CASE WHEN api_keys_vault.encrypted_key IS NULL OR api_keys_vault.encrypted_key = '' THEN EXCLUDED.encrypted_key ELSE api_keys_vault.encrypted_key END,
+             models = EXCLUDED.models,
+             model_list = EXCLUDED.model_list,
+             is_active = true,
+             updated_at = CURRENT_TIMESTAMP`,
+        [providerId, encrypt(cleanApiKey), JSON.stringify(models)]
+      );
+      invalidateVaultCache(providerId);
+      invalidateApiKeysVaultCache();
+
+      // Auto-assign any unconfigured tools in tool_orchestrator dynamically from synced models
+      try {
+        const textModel = models.find((m: any) => {
+          const id = (m.id || m.name || '').toLowerCase();
+          const methods = m.supportedMethods || m.supportedGenerationMethods || [];
+          const supportsText = methods.length === 0 || methods.includes('generateContent');
+          return supportsText && (id.includes('3.6-flash') || id.includes('3.8-flash'));
+        }) || models.find((m: any) => {
+          const id = (m.id || m.name || '').toLowerCase();
+          const methods = m.supportedMethods || m.supportedGenerationMethods || [];
+          const supportsText = methods.length === 0 || methods.includes('generateContent');
+          return supportsText && !id.includes('tts') && !id.includes('image') && !id.includes('embedding') && !id.includes('transcribe') && !id.includes('robotics') && !id.includes('computer-use') && !id.includes('antigravity') && !id.includes('deep-research');
+        }) || models[0];
+
+        if (textModel) {
+          const modelId = textModel.id || textModel.name || (typeof textModel === 'string' ? textModel : '');
+          if (modelId) {
+            await pool.query(`
+              UPDATE tool_orchestrator
+              SET primary_provider = $1, primary_model = $2, updated_at = CURRENT_TIMESTAMP
+              WHERE (primary_provider IS NULL OR primary_provider = '' OR primary_model IS NULL OR primary_model = '')
+                AND tool_id IN ('chat_fast', 'chat_pro', 'chat_reasoning', 'perplexta_analysis', 'ads_copilot', 'code', 'sovereign_search', 'x402_api')
+            `, [providerId, modelId]);
+            invalidateOrchestratorConfigCache();
+          }
+        }
+      } catch (err: any) {
+        console.warn('[AI Service] Auto-route assignment notice:', err?.message || err);
+      }
+    }
+    return { models, count };
+  } catch (error) {
+    console.error(`[SyncInternal] Error syncing ${providerId}:`, error);
+    throw error;
+  } finally {
+    clearTimeoutTimer();
+  }
+}
+
+const vaultCache = new Map<string, { value: string; expiresAt: number }>();
+const urlKeyCache = new Map<string, { value: string; expiresAt: number }>();
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes cache TTL
+
+export async function getProviderKey(provider: string): Promise<string | null> {
+  const normProvider = provider.toLowerCase().replace(/\s+/g, '');
+  const now = Date.now();
+  
+  if (vaultCache.has(normProvider)) {
+    const cached = vaultCache.get(normProvider)!;
+    if (now < cached.expiresAt) {
+      return cached.value;
+    } else {
+      vaultCache.delete(normProvider);
+    }
+  }
+
+  let decryptedKey: string | null = null;
+  try {
+    const result = await pool.query('SELECT encrypted_key, url_key, is_active, daily_budget, used_today, last_reset_date FROM api_keys_vault WHERE provider = $1', [normProvider]);
+    if (result.rows.length > 0) {
+      const row = result.rows[0];
+      if (row.is_active === false) {
+        return null;
+      }
+
+      // Strict Daily Budget Limit Enforcement
+      const dailyBudget = parseFloat(String(row.daily_budget || '0'));
+      let usedToday = parseFloat(String(row.used_today || '0'));
+      const todayStr = new Date().toISOString().split('T')[0];
+      const resetDateStr = row.last_reset_date ? new Date(row.last_reset_date).toISOString().split('T')[0] : '';
+
+      if (resetDateStr && resetDateStr !== todayStr) {
+        usedToday = 0;
+        pool.query('UPDATE api_keys_vault SET used_today = 0, last_reset_date = CURRENT_DATE WHERE provider = $1', [normProvider]).catch(() => {});
+      }
+
+      if (dailyBudget > 0 && usedToday >= dailyBudget) {
+        console.warn(`[AI Service] Provider '${normProvider}' reached daily budget limit ($${usedToday.toFixed(4)} / $${dailyBudget}). Request BLOCKED before server dispatch.`);
+        return null;
+      }
+
+      if (row.encrypted_key) {
+        decryptedKey = decrypt(row.encrypted_key);
+      }
+      if (row.url_key) {
+        urlKeyCache.set(normProvider, { value: row.url_key, expiresAt: now + CACHE_TTL_MS });
+      }
+      if (decryptedKey && decryptedKey.trim().length > 0) {
+        vaultCache.set(normProvider, { value: decryptedKey, expiresAt: now + CACHE_TTL_MS });
+        return decryptedKey;
+      }
+      
+      // If DB has no key for google/gemini, fallback to environment GEMINI_API_KEY
+      if ((normProvider === 'google' || normProvider === 'gemini') && process.env.GEMINI_API_KEY) {
+        vaultCache.set(normProvider, { value: process.env.GEMINI_API_KEY, expiresAt: now + CACHE_TTL_MS });
+        return process.env.GEMINI_API_KEY;
+      }
+      return null;
+    } else {
+      // Check if vault has any records at all
+      const totalCountRes = await pool.query('SELECT COUNT(*) as cnt FROM api_keys_vault').catch(() => ({ rows: [{ cnt: '0' }] }));
+      const totalCnt = parseInt(totalCountRes.rows[0]?.cnt || '0', 10);
+      if (totalCnt > 0 && normProvider !== 'google' && normProvider !== 'gemini') {
+        // Vault has records, meaning keys are managed and this provider was explicitly deleted/not added
+        return null;
+      }
+    }
+  } catch (_) {}
+
+  // Environment fallback for Google / Gemini
+  if ((normProvider === 'google' || normProvider === 'gemini') && process.env.GEMINI_API_KEY) {
+    vaultCache.set(normProvider, { value: process.env.GEMINI_API_KEY, expiresAt: now + CACHE_TTL_MS });
+    return process.env.GEMINI_API_KEY;
+  }
+
+  return null;
+}
+
+export async function getProviderUrlKey(provider: string): Promise<string | null> {
+  const normProvider = provider.toLowerCase().replace(/\s+/g, '');
+  const now = Date.now();
+  
+  if (urlKeyCache.has(normProvider)) {
+    const cached = urlKeyCache.get(normProvider)!;
+    if (now < cached.expiresAt) {
+      return cached.value;
+    } else {
+      urlKeyCache.delete(normProvider);
+    }
+  }
+
+  let urlKey: string | null = null;
+  try {
+    const result = await pool.query('SELECT url_key FROM api_keys_vault WHERE provider = $1', [normProvider]);
+    if (result.rows.length > 0 && result.rows[0].url_key) {
+      urlKey = result.rows[0].url_key;
+      urlKeyCache.set(normProvider, { value: urlKey as string, expiresAt: now + CACHE_TTL_MS });
+    }
+  } catch (_) {}
+
+  return urlKey;
+}
+
+export function invalidateVaultCache(provider?: string) {
+  memoryCache.clear();
+  if (provider) {
+    const clean = provider.toLowerCase().replace(/\s+/g, '');
+    vaultCache.delete(clean);
+    urlKeyCache.delete(clean);
+  } else {
+    vaultCache.clear();
+    urlKeyCache.clear();
+  }
+}
+
+export async function checkProviderStatus(provider: string, apiKey: string, urlKey?: string) {
+    const { signal: timeoutSignal, clear: clearTimeoutTimer } = createTimeoutSignal(25000);
+    try {
+        const normProvider = provider.toLowerCase();
+        let status = { isValid: false, usage: 0, limit: 0, message: '' };
+
+        if (normProvider === 'openai') {
+            const res = await fetch('https://api.openai.com/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `OpenAI: ${res.statusText}`;
+        } else if (normProvider === 'deepseek') {
+            const res = await fetch('https://api.deepseek.com/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `DeepSeek: ${res.statusText}`;
+        } else if (normProvider === 'anthropic') {
+            const res = await fetch('https://api.anthropic.com/v1/models', {
+                headers: { 
+                  'x-api-key': apiKey, 
+                  'anthropic-version': '2023-06-01',
+                  'Accept': 'application/json'
+                },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `Anthropic: ${res.statusText}`;
+        } else if (normProvider === 'google' || normProvider === 'gemini') {
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models`, {
+                headers: { 'x-goog-api-key': apiKey },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `Google AI: ${res.statusText}`;
+        } else if (normProvider === 'together') {
+            const res = await fetch('https://api.together.xyz/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+        } else if (normProvider === 'openrouter') {
+            const res = await fetch('https://openrouter.ai/api/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+        } else if (normProvider === 'groq') {
+            const res = await fetch('https://api.groq.com/openai/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `Groq: ${res.statusText}`;
+        } else if (normProvider.includes('ollama')) {
+            const cleanUrl = cleanOllamaUrl(urlKey || '');
+            const targetHeaders: any = { 
+                'Accept': 'application/json',
+                'ngrok-skip-browser-warning': '69420',
+                'Bypass-Tunnel-Reminder': 'true'
+            };
+            let keyToUse = apiKey || '';
+            if (urlKey && keyToUse.startsWith(urlKey)) {
+                keyToUse = keyToUse.substring(urlKey.length);
+                if (keyToUse.startsWith(':')) {
+                    keyToUse = keyToUse.substring(1);
+                }
+            }
+            if (keyToUse && keyToUse.trim() !== '' && !keyToUse.includes('http')) {
+                const trimmedKey = keyToUse.trim();
+                if (trimmedKey.startsWith('Bearer ') || trimmedKey.startsWith('Basic ')) {
+                    targetHeaders['Authorization'] = trimmedKey;
+                } else {
+                    targetHeaders['Authorization'] = `Bearer ${trimmedKey}`;
+                }
+            }
+            try {
+                let res = await fetch(`${cleanUrl}/api/tags`, { headers: targetHeaders, signal: timeoutSignal });
+                if (!res.ok && (res.status === 401 || res.status === 403) && targetHeaders['Authorization']) {
+                    const headersNoAuth = { ...targetHeaders };
+                    delete headersNoAuth['Authorization'];
+                    res = await fetch(`${cleanUrl}/api/tags`, { headers: headersNoAuth, signal: timeoutSignal });
+                }
+                status.isValid = res.ok;
+                if (!res.ok) {
+                    status.message = `Ollama: Connection failed (${res.status}): ${res.statusText}`;
+                }
+            } catch (err: any) {
+                status.isValid = false;
+                status.message = `Ollama: Failed to connect to ${cleanUrl} (${err.message})`;
+            }
+        } else if (normProvider === 'mistral') {
+            const res = await fetch('https://api.mistral.ai/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `Mistral AI: ${res.statusText}`;
+        } else if (normProvider === 'elevenlabs') {
+            const res = await fetch('https://api.elevenlabs.io/v1/models', {
+                headers: { 'xi-api-key': apiKey },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `ElevenLabs: ${res.statusText}`;
+        } else if (normProvider === 'xai' || normProvider === 'grok') {
+            const res = await fetch('https://api.x.ai/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                signal: timeoutSignal
+            });
+            status.isValid = res.ok;
+            if (!res.ok) status.message = `xAI (Grok): ${res.statusText}`;
+        } else if (normProvider === 'serper') {
+            try {
+                const res = await fetch('https://google.serper.dev/search', {
+                    method: 'POST',
+                    headers: {
+                        'X-API-KEY': apiKey,
+                        'Content-Type': 'application/json',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    },
+                    body: JSON.stringify({ q: 'apple', num: 1 }),
+                    signal: timeoutSignal
+                });
+                status.isValid = res.ok;
+                if (!res.ok) {
+                    const errText = await res.text().catch(() => '');
+                    status.message = `Serper: Connection failed (${res.status}): ${errText || res.statusText}`;
+                }
+            } catch (err: any) {
+                status.isValid = false;
+                status.message = `Serper: Failed to connect (${err.message})`;
+            }
+        } else {
+            let baseUrl = urlKey;
+            if (!baseUrl) {
+                baseUrl = await getProviderUrlKey(normProvider) || undefined;
+            }
+            if (baseUrl) {
+                let cleanUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+                if (cleanUrl.endsWith('/chat/completions')) cleanUrl = cleanUrl.replace('/chat/completions', '');
+                else if (cleanUrl.endsWith('/models')) cleanUrl = cleanUrl.replace('/models', '');
+                else if (cleanUrl.endsWith('/api/chat')) cleanUrl = cleanUrl.replace('/api/chat', '');
+
+                try {
+                    let res = await fetch(`${cleanUrl}/models`, {
+                        headers: { 'Authorization': `Bearer ${apiKey}` },
+                        signal: timeoutSignal
+                    });
+                    
+                    if (!res.ok && res.status === 404 && !cleanUrl.endsWith('/v1')) {
+                        res = await fetch(`${cleanUrl}/v1/models`, {
+                            headers: { 'Authorization': `Bearer ${apiKey}` },
+                            signal: timeoutSignal
+                        });
+                    }
+
+                    status.isValid = res.ok;
+                    if (!res.ok) {
+                        status.message = `Custom Provider Connection Warning (${res.status}): ${res.statusText}. Continuing save anyway.`;
+                        status.isValid = true;
+                    }
+                } catch (fetchErr: any) {
+                    status.isValid = true;
+                    status.message = `Warning: Custom provider endpoint unreachable: ${fetchErr.message}. Custom provider key saved without live validation.`;
+                }
+            } else {
+                status.isValid = true;
+                status.message = 'Warning: No API Base URL provided. Verification skipped. Please configure base URL to fetch models dynamically.';
+            }
+        }
+
+        return status;
+    } catch (e: any) {
+        return { isValid: false, usage: 0, limit: 0, message: e.message };
+    } finally {
+        clearTimeoutTimer();
+    }
+}
+
+function transformMessagesForOpenAI(messages: any[]): any[] {
+  return messages.map(msg => {
+    if (typeof msg.content === 'string') {
+      return { role: msg.role, content: msg.content };
+    }
+    if (Array.isArray(msg.content)) {
+      const content = msg.content.map((block: any) => {
+        if (block.type === 'text') {
+          return { type: 'text', text: block.text || '' };
+        }
+        if (block.type === 'image') {
+          const mime = block.mime_type || 'image/jpeg';
+          return {
+            type: 'image_url',
+            image_url: {
+              url: `data:${mime};base64,${block.data}`
+            }
+          };
+        }
+        const nameStr = block.name ? ` "${block.name}"` : '';
+        return {
+          type: 'text',
+          text: `[Attached File:${nameStr} (${block.mime_type || 'unsupported-media-type'})]`
+        };
+      });
+      return { role: msg.role, content };
+    }
+    return { role: msg.role, content: String(msg.content || '') };
+  });
+}
+
+function transformMessagesForAnthropic(messages: any[]): any[] {
+  return messages.map(msg => {
+    if (typeof msg.content === 'string') {
+      return { role: msg.role, content: msg.content };
+    }
+    if (Array.isArray(msg.content)) {
+      const content = msg.content.map((block: any) => {
+        if (block.type === 'text') {
+          return { type: 'text', text: block.text || '' };
+        }
+        if (block.type === 'image') {
+          return {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: block.mime_type || 'image/jpeg',
+              data: block.data
+            }
+          };
+        }
+        if (block.type === 'file' && block.mime_type === 'application/pdf') {
+          return {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: 'application/pdf',
+              data: block.data
+            }
+          };
+        }
+        const nameStr = block.name ? ` "${block.name}"` : '';
+        return {
+          type: 'text',
+          text: `[Attached File:${nameStr} (${block.mime_type || 'unsupported-media-type'})]`
+        };
+      });
+      return { role: msg.role, content };
+    }
+    return { role: msg.role, content: String(msg.content || '') };
+  });
+}
+
+function transformMessagesForGemini(messages: any[]): any[] {
+  const result: any[] = [];
+
+  for (const m of messages) {
+    if (m.role === 'system') continue;
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    let parts: any[] = [];
+
+    if (typeof m.content === 'string') {
+      if (m.content) parts = [{ text: m.content }];
+    } else if (Array.isArray(m.content)) {
+      parts = m.content.map((block: any) => {
+        if (block.type === 'text') {
+          return { text: block.text || '' };
+        }
+        return {
+          inline_data: {
+            mime_type: block.mime_type || 'image/jpeg',
+            data: block.data
+          }
+        };
+      }).filter((p: any) => p.text !== '' || p.inline_data);
+    } else if (m.content) {
+      parts = [{ text: String(m.content) }];
+    }
+
+    if (parts.length === 0) continue;
+
+    if (result.length > 0 && result[result.length - 1].role === role) {
+      result[result.length - 1].parts.push(...parts);
+    } else {
+      result.push({ role, parts });
+    }
+  }
+
+  if (result.length === 0) {
+    result.push({ role: 'user', parts: [{ text: ' ' }] });
+  } else if (result[0].role === 'model') {
+    result.unshift({ role: 'user', parts: [{ text: ' ' }] });
+  }
+
+  return result;
+}
+
+function transformMessagesForOllama(messages: any[]): any[] {
+  return messages.map(msg => {
+    if (typeof msg.content === 'string') {
+      return { role: msg.role, content: msg.content };
+    }
+    if (Array.isArray(msg.content)) {
+      const parts: string[] = [];
+      const images: string[] = [];
+      msg.content.forEach((block: any) => {
+        if (block.type === 'text') {
+          if (block.text) parts.push(block.text);
+        } else if (block.type === 'image' && block.data) {
+          let rawBase64 = block.data;
+          if (rawBase64.includes(';base64,')) {
+            rawBase64 = rawBase64.split(';base64,')[1];
+          }
+          images.push(rawBase64);
+        } else {
+          const nameStr = block.name ? ` "${block.name}"` : '';
+          parts.push(`[Attached File:${nameStr} (${block.mime_type || 'unsupported-media-type'})]`);
+        }
+      });
+      const contentString = parts.join('\n');
+      const transformed: any = { role: msg.role, content: contentString };
+      if (images.length > 0) {
+        transformed.images = images;
+      }
+      return transformed;
+    }
+    return { role: msg.role, content: String(msg.content || '') };
+  });
+}
+
+export async function callAIProvider(
+  provider: string, 
+  model: string, 
+  apiKey: string, 
+  prompt: string, 
+  systemPrompt?: string, 
+  onChunk?: (chunk: string) => void, 
+  history: { role: string, content: string }[] = [],
+  options: any = {},
+  preloadedUrlKey?: string
+) {
+  const normProvider = provider.toLowerCase().replace(/\s+/g, '');
+  let keyToUse = apiKey ? apiKey.trim() : '';
+
+  // Ensure we strip the custom URL from the key if it was pre-pended during vault storage
+  if (preloadedUrlKey && keyToUse.startsWith(preloadedUrlKey)) {
+    keyToUse = keyToUse.substring(preloadedUrlKey.length);
+    if (keyToUse.startsWith(':')) {
+      keyToUse = keyToUse.substring(1);
+    }
+  }
+
+  const cleanApiKey = keyToUse.trim();
+  if (!cleanApiKey) throw new Error(`No valid API key provided for ${provider}`);
+
+  let cleanModel = model.trim();
+
+  if (cleanModel.includes('/') && !cleanModel.startsWith('models/')) {
+    const parts = cleanModel.split('/');
+    if (normProvider === 'google' || normProvider === 'gemini' || normProvider === 'openai' || normProvider === 'anthropic') {
+      if (parts[0].toLowerCase() === normProvider || parts[0].toLowerCase() === 'google' || parts[0].toLowerCase() === 'openai' || parts[0].toLowerCase() === 'anthropic') {
+        cleanModel = parts.slice(1).join('/');
+      }
+    } else if (normProvider === 'groq') {
+      // Groq uses publisher namespace prefixes like openai/gpt-oss-120b or qwen/qwen3.8-27b
+      if (parts[0].toLowerCase() === 'groq' && parts.length === 2 && (parts[1].startsWith('llama3-') || parts[1].startsWith('mixtral-'))) {
+        cleanModel = parts[1];
+      }
+    }
+  }
+
+  // Dynamic configuration is loaded completely from the database-driven tool orchestrator registry.
+
+  const messages: any[] = [];
+  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+  history.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
+
+  let messageContent: any = prompt;
+  if (options.fileData?.data) {
+     const { type: mimeType, data: base64Data, name: fileName } = options.fileData;
+     const isImage = mimeType.startsWith('image/');
+     const isVideo = mimeType.startsWith('video/');
+     const isAudio = mimeType.startsWith('audio/');
+     const isPdf = mimeType === 'application/pdf';
+     
+     if (isImage || isVideo || isAudio || isPdf) {
+         messageContent = [
+             { type: 'text', text: prompt },
+             { 
+                 type: isImage ? 'image' : (isVideo ? 'video' : (isAudio ? 'audio' : 'file')), 
+                 mime_type: mimeType, 
+                 data: base64Data,
+                 name: fileName
+             }
+         ];
+     }
+  }
+  messages.push({ role: 'user', content: messageContent });
+
+  const isStreaming = !!onChunk;
+
+  async function handleResponse(response: Response) {
+    if (!response.ok) {
+       let errorText = '';
+       let extractedMessage = '';
+       try {
+         const errorJson = await response.json();
+         errorText = JSON.stringify(errorJson);
+         extractedMessage = errorJson.error?.message || errorJson.message || errorJson.error || '';
+       } catch (e) {
+         try {
+           errorText = await response.text();
+         } catch (_) {}
+       }
+       if (response.status === 429) { console.warn(`[AI Service] Rate Limit Hit (429) for ${normProvider}/${cleanModel}: ${extractedMessage.substring(0, 150) || 'Provider quota or rate limit exceeded.'}`); } else { console.error(`[AI Service] Provider Error (${response.status}) for ${normProvider}/${cleanModel}: ${errorText.substring(0, 300)}`); }
+       
+       const baseErrorMessage = extractedMessage 
+         ? `The AI provider encountered an issue (${response.status}): ${extractedMessage}`
+         : `The AI provider encountered an issue (${response.status}). Please check your API keys or fallback to another model.`;
+         
+       throw new Error(baseErrorMessage);
+    }
+
+    if (isStreaming && response.body) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let resultText = '';
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (trimmedLine.startsWith('data:')) {
+            const dataStr = trimmedLine.substring(trimmedLine.startsWith('data: ') ? 6 : 5).trim();
+            if (dataStr === '[DONE]') continue;
+            try {
+              const data = JSON.parse(dataStr);
+              let chunk = '';
+              if (normProvider === 'anthropic') {
+                if (data.type === 'content_block_delta') chunk = data.delta?.text || '';
+              } else if (normProvider.includes('google') || normProvider.includes('gemini')) {
+                chunk = data.candidates?.[0]?.content?.parts?.map((p: any) => p.text || '').join('') || '';
+              } else {
+                chunk = data.choices?.[0]?.delta?.content || '';
+              }
+              if (chunk) { resultText += chunk; onChunk(chunk); }
+            } catch (e: any) {
+              if (e && e.message && e.message.includes('OUT_OF_POINTS_BUDGET_HALT')) {
+                throw e;
+              }
+            }
+          } else if (normProvider.includes('ollama') && trimmedLine.startsWith('{') && trimmedLine.endsWith('}')) {
+             try {
+               const data = JSON.parse(trimmedLine);
+               let chunk = data.message?.content || '';
+               if (chunk) { resultText += chunk; onChunk(chunk); }
+             } catch (e: any) {
+               if (e && e.message && e.message.includes('OUT_OF_POINTS_BUDGET_HALT')) {
+                 throw e;
+               }
+             }
+          }
+        }
+      }
+      return resultText;
+    } else {
+      const data = await response.json();
+      if (normProvider === 'anthropic') return data.content?.[0]?.text || '';
+      if (normProvider.includes('google') || normProvider.includes('gemini')) {
+        const parts = data.candidates?.[0]?.content?.parts;
+        const text = parts ? parts.map((p: any) => p.text || '').join('') : '';
+        if (!text && data.error) throw new Error(`Google AI Error: ${data.error.message || 'Unknown error'}`);
+        return text || '';
+      }
+      return data.choices?.[0]?.message?.content || '';
+    }
+  }
+
+  let url = '';
+  let headers: any = { 'Content-Type': 'application/json' };
+  let body: any = {};
+  let fetchSignal: AbortSignal | undefined;
+
+  const effectiveTemperature = typeof options?.temperature === 'number' ? options.temperature : (options?.toolId === 'code' ? 0.15 : undefined);
+  const effectiveTopP = typeof options?.topP === 'number' ? options.topP : (options?.toolId === 'code' ? 0.95 : undefined);
+  const effectiveMaxTokens = typeof options?.maxOutputTokens === 'number' ? options.maxOutputTokens : (options?.toolId === 'code' ? 16384 : 8192);
+
+  if (normProvider === 'openai' || normProvider === 'deepseek' || normProvider === 'together' || normProvider === 'openrouter' || normProvider === 'xai' || normProvider === 'grok' || normProvider === 'groq' || normProvider === 'mistral') {
+    if (normProvider === 'openai') url = 'https://api.openai.com/v1/chat/completions';
+    else if (normProvider === 'deepseek') url = 'https://api.deepseek.com/chat/completions';
+    else if (normProvider === 'together') url = 'https://api.together.xyz/v1/chat/completions';
+    else if (normProvider === 'openrouter') url = 'https://openrouter.ai/api/v1/chat/completions';
+    else if (normProvider === 'xai' || normProvider === 'grok') url = 'https://api.x.ai/v1/chat/completions';
+    else if (normProvider === 'groq') url = 'https://api.groq.com/openai/v1/chat/completions';
+    else if (normProvider === 'mistral') url = 'https://api.mistral.ai/v1/chat/completions';
+    
+    headers['Authorization'] = `Bearer ${cleanApiKey}`;
+    if (normProvider === 'openrouter') {
+      headers['HTTP-Referer'] = 'https://perplexta.ai';
+      headers['X-Title'] = 'Perplexta Platform';
+      // OpenRouter sometimes hangs on standard streaming parsing if provider doesn't support it well, but stream is true here
+    }
+    const mappedMessages = transformMessagesForOpenAI(messages);
+    body = { 
+      model: cleanModel, 
+      messages: mappedMessages, 
+      stream: isStreaming, 
+      max_tokens: effectiveMaxTokens,
+      ...(effectiveTemperature !== undefined ? { temperature: effectiveTemperature } : {}),
+      ...(effectiveTopP !== undefined ? { top_p: effectiveTopP } : {})
+    };
+    
+    // OpenRouter Optimization: Prevent aggressive upstream fallback chaining which causes 30s+ latency
+    if (normProvider === 'openrouter') {
+      body.route = 'fallback'; // Ensures it doesn't get stuck in deep queues if primary upstream is dead
+    }
+  } else if (normProvider === 'anthropic') {
+    url = 'https://api.anthropic.com/v1/messages';
+    headers['x-api-key'] = cleanApiKey;
+    headers['anthropic-version'] = '2023-06-01';
+    headers['anthropic-beta'] = 'pdfs-2024-09-25';
+    const mappedMessages = transformMessagesForAnthropic(messages);
+    body = { 
+      model: cleanModel, 
+      max_tokens: effectiveMaxTokens, 
+      stream: isStreaming, 
+      messages: mappedMessages.filter(m => m.role !== 'system'),
+      ...(effectiveTemperature !== undefined ? { temperature: effectiveTemperature } : {}),
+      ...(effectiveTopP !== undefined ? { top_p: effectiveTopP } : {})
+    };
+    if (systemPrompt) body.system = systemPrompt;
+  } else if (normProvider.includes('google') || normProvider.includes('gemini')) {
+    const method = isStreaming ? 'streamGenerateContent' : 'generateContent';
+    let modelPath = cleanModel;
+    if (!modelPath.startsWith('models/')) {
+      modelPath = `models/${modelPath}`;
+    }
+    url = `https://generativelanguage.googleapis.com/v1beta/${modelPath}:${method}`;
+    if (isStreaming) url += '?alt=sse';
+    headers['x-goog-api-key'] = cleanApiKey;
+    const isTtsModel = cleanModel.toLowerCase().includes('tts');
+    const isDeveloperInstructionUnsupported = isTtsModel || 
+      cleanModel.toLowerCase().includes('antigravity') || 
+      cleanModel.toLowerCase().includes('deep-research');
+    const geminiContents = transformMessagesForGemini(messages);
+    body = { 
+      contents: geminiContents,
+      generationConfig: {
+        maxOutputTokens: effectiveMaxTokens,
+        ...(effectiveTemperature !== undefined ? { temperature: effectiveTemperature } : {}),
+        ...(effectiveTopP !== undefined ? { topP: effectiveTopP } : {})
+      }
+    };
+    if (systemPrompt) {
+      if (isDeveloperInstructionUnsupported) {
+        if (geminiContents.length > 0 && geminiContents[0].parts && geminiContents[0].parts.length > 0) {
+          const firstPart = geminiContents[0].parts[0];
+          if (typeof firstPart.text === 'string') {
+            firstPart.text = `[System Protocol:\n${systemPrompt}]\n\nUser Prompt:\n${firstPart.text}`;
+          } else {
+            geminiContents[0].parts.unshift({ text: `[System Protocol:\n${systemPrompt}]` });
+          }
+        } else {
+          geminiContents.unshift({ role: 'user', parts: [{ text: `[System Protocol:\n${systemPrompt}]` }] });
+        }
+      } else {
+        body.system_instruction = { parts: [{ text: systemPrompt }] };
+      }
+    }
+  } else if (normProvider.includes('ollama')) {
+    const resolvedUrl = preloadedUrlKey ?? (await getProviderUrlKey(normProvider)) ?? '';
+    const cleanUrl = cleanOllamaUrl(resolvedUrl);
+    url = `${cleanUrl}/api/chat`;
+    headers['ngrok-skip-browser-warning'] = '69420';
+    headers['Bypass-Tunnel-Reminder'] = 'true';
+    if (cleanApiKey && cleanApiKey.trim() !== '' && !cleanApiKey.includes('http')) {
+      const trimmedKey = cleanApiKey.trim();
+      if (trimmedKey.startsWith('Bearer ') || trimmedKey.startsWith('Basic ')) {
+        headers['Authorization'] = trimmedKey;
+      } else {
+        headers['Authorization'] = `Bearer ${trimmedKey}`;
+      }
+    }
+    const mappedMessages = transformMessagesForOllama(messages);
+    body = { model: cleanModel, messages: mappedMessages, stream: isStreaming };
+    const OLLAMA_TIMEOUT_MS = 4000;
+    const { signal, clear: clearOllamaTimer } = createTimeoutSignal(OLLAMA_TIMEOUT_MS);
+    fetchSignal = signal;
+    try {
+      let res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: fetchSignal });
+      clearOllamaTimer();
+      if (!res.ok && (res.status === 401 || res.status === 403) && headers['Authorization']) {
+        console.warn(`[AI Service] Ollama returned ${res.status} with Authorization header. Retrying without Authorization...`);
+        const headersNoAuth = { ...headers };
+        delete headersNoAuth['Authorization'];
+        const { signal: retrySignal, clear: clearRetryTimer } = createTimeoutSignal(OLLAMA_TIMEOUT_MS);
+        res = await fetch(url, { method: 'POST', headers: headersNoAuth, body: JSON.stringify(body), signal: retrySignal });
+        clearRetryTimer();
+      }
+      return handleResponse(res);
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        throw new Error(`Ollama provider unreachable/timed out after ${OLLAMA_TIMEOUT_MS / 1000}s. Check your Ollama server.`);
+      }
+      throw err;
+    }
+  } else {
+    const resolvedUrl = preloadedUrlKey ?? (await getProviderUrlKey(normProvider)) ?? '';
+    let cleanUrl = resolvedUrl ? (resolvedUrl.endsWith('/') ? resolvedUrl.slice(0, -1) : resolvedUrl) : '';
+    
+    if (!cleanUrl) {
+      throw new Error(`Custom provider '${provider}' is missing a registered endpoint URL (url_key) in the vault.`);
+    }
+
+    if (cleanUrl.endsWith('/chat/completions')) {
+    } else if (cleanUrl.endsWith('/models')) {
+      cleanUrl = cleanUrl.replace('/models', '');
+    } else if (cleanUrl.endsWith('/api/chat')) {
+      cleanUrl = cleanUrl.replace('/api/chat', '');
+    }
+    
+    url = `${cleanUrl}/chat/completions`;
+    
+    if (cleanApiKey && cleanApiKey.trim() !== '') {
+      headers['Authorization'] = cleanApiKey.startsWith('Bearer ') ? cleanApiKey : `Bearer ${cleanApiKey}`;
+    }
+    
+    const mappedMessages = transformMessagesForOpenAI(messages);
+    body = { model: cleanModel, messages: mappedMessages, stream: isStreaming, max_tokens: 8192 };
+
+    const { signal, clear: clearCustomTimer } = createTimeoutSignal(CUSTOM_PROVIDER_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
+      clearCustomTimer();
+      return handleResponse(res);
+    } catch (err: any) {
+      clearCustomTimer();
+      if (err.name === 'AbortError') {
+        throw new Error(`Custom provider timed out after ${CUSTOM_PROVIDER_TIMEOUT_MS / 1000}s. Check your provider URL and availability.`);
+      }
+      throw err;
+    }
+  }
+
+  let res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+
+  // Failures or model-not-found errors bubble up naturally to be resolved dynamically by the Orchestrator fallback registry configurations.
+
+  if (!res.ok && (normProvider.includes('google') || normProvider.includes('gemini'))) {
+    try {
+      const clonedRes = res.clone();
+      const errJson = await clonedRes.json();
+      const errorDetail = JSON.stringify(errJson);
+      
+      const isQuotaOrOverloaded = res.status === 429 || res.status === 503 || errorDetail.includes('RESOURCE_EXHAUSTED') || errorDetail.includes('quota') || errorDetail.includes('overloaded') || errorDetail.includes('high demand') || errorDetail.includes('UNAVAILABLE');
+      
+      if (isQuotaOrOverloaded) {
+        console.warn(`[AI Service] Rate limit / High demand (${res.status}) encountered for model ${cleanModel}. Initiating fast retry for temporary demand spikes...`);
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const delayMs = attempt * 850;
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          try {
+            const retryRes = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+            if (retryRes.ok) {
+              console.log(`[AI Service] Request recovered successfully from temporary spike on attempt ${attempt} for ${cleanModel}.`);
+              return handleResponse(retryRes);
+            }
+            res = retryRes;
+          } catch (retryErr) {
+            console.warn(`[AI Service] Fast retry attempt ${attempt} network error:`, retryErr);
+          }
+        }
+        console.warn(`[AI Service] Model ${cleanModel} still unavailable after retries. Deferring to Orchestrator dynamic database fallback chain.`);
+      }
+
+      const is404 = res.status === 404 || errorDetail.includes('NOT_FOUND') || errorDetail.includes('is not found') || errorDetail.includes('not found');
+      
+      if (is404) {
+        console.warn(`[AI Service] 404 Not Found received for Google/Gemini model ${cleanModel}. Initiating self-healing...`);
+        
+        if (url.includes('/v1beta/')) {
+          const stableUrl = url.replace('/v1beta/', '/v1/');
+          console.warn(`[AI Service] Retrying on stable v1 endpoint: ${stableUrl}`);
+          const retryRes = await fetch(stableUrl, { method: 'POST', headers, body: JSON.stringify(body) });
+          if (retryRes.ok) {
+            console.log(`[AI Service] Self-healed successfully on stable v1 endpoint for ${cleanModel}.`);
+            return handleResponse(retryRes);
+          }
+        }
+        
+        // Removed hardcoded alternative models fallback; the Orchestrator will handle failover.
+      }
+      
+      const isMultiturnDisabled = errorDetail.includes('Multiturn chat is not enabled for this model') || 
+                                  errorDetail.includes('multiturn') ||
+                                  (errJson.error?.message && errJson.error.message.includes('Multiturn chat'));
+                                  
+      if (isMultiturnDisabled && messages.length > 1) {
+        console.warn(`[AI Service] Model ${cleanModel} does not support multiturn chat. Retrying with only the final user prompt...`);
+        // Extract only the system instructions and the latest user prompt
+        const singleTurnMessages = messages.filter(m => m.role === 'system' || m === messages[messages.length - 1]);
+        const isTtsModel = cleanModel.toLowerCase().includes('tts');
+        const geminiContents = transformMessagesForGemini(singleTurnMessages);
+        body = { 
+          contents: geminiContents,
+          generationConfig: {
+            maxOutputTokens: 8192
+          }
+        };
+        if (systemPrompt) {
+          if (isTtsModel) {
+            if (geminiContents.length > 0 && geminiContents[0].parts && geminiContents[0].parts.length > 0) {
+              const firstPart = geminiContents[0].parts[0];
+              if (typeof firstPart.text === 'string') {
+                firstPart.text = `[System Protocol:\n${systemPrompt}]\n\nUser Prompt:\n${firstPart.text}`;
+              } else {
+                geminiContents[0].parts.unshift({ text: `[System Protocol:\n${systemPrompt}]` });
+              }
+            } else {
+              geminiContents.unshift({ role: 'user', parts: [{ text: `[System Protocol:\n${systemPrompt}]` }] });
+            }
+          } else {
+            body.system_instruction = { parts: [{ text: systemPrompt }] };
+          }
+        }
+        
+        res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+      }
+
+      const isDeveloperInstructionDisabled = errorDetail.includes('Developer instruction is not enabled') ||
+                                            (errJson.error?.message && errJson.error.message.includes('Developer instruction is not enabled'));
+      if (isDeveloperInstructionDisabled) {
+        console.warn(`[AI Service] Developer instruction not supported on ${cleanModel}. Self-healing by retrying with system prompt embedded in user message...`);
+        const fallbackContents = transformMessagesForGemini(messages);
+        if (systemPrompt) {
+          if (fallbackContents.length > 0 && fallbackContents[0].parts && fallbackContents[0].parts.length > 0) {
+            const firstPart = fallbackContents[0].parts[0];
+            if (typeof firstPart.text === 'string') {
+              firstPart.text = `[System Protocol:\n${systemPrompt}]\n\nUser Prompt:\n${firstPart.text}`;
+            } else {
+              fallbackContents[0].parts.unshift({ text: `[System Protocol:\n${systemPrompt}]` });
+            }
+          } else {
+            fallbackContents.unshift({ role: 'user', parts: [{ text: `[System Protocol:\n${systemPrompt}]` }] });
+          }
+        }
+        const retryBody: any = {
+          contents: fallbackContents,
+          generationConfig: {
+            maxOutputTokens: effectiveMaxTokens,
+            ...(effectiveTemperature !== undefined ? { temperature: effectiveTemperature } : {}),
+            ...(effectiveTopP !== undefined ? { topP: effectiveTopP } : {})
+          }
+        };
+        const retryRes = await fetch(url, { method: 'POST', headers, body: JSON.stringify(retryBody) });
+        if (retryRes.ok) {
+          console.log(`[AI Service] Self-healed successfully without Developer instruction for ${cleanModel}.`);
+          return handleResponse(retryRes);
+        }
+        res = retryRes;
+      }
+    } catch (e) {
+      console.error('[AI Service] Error checking or recovering from Gemini multi-turn response:', e);
+    }
+  }
+
+  return handleResponse(res);
+}
